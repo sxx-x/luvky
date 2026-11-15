@@ -1,16 +1,20 @@
 /**
- * 房间服务：替代原项目依赖的 Laf 云函数。
- * 提供 /room-operate、/parse-text、/pt-service，以及 /ws 实时同步。
- * 若存在前端构建产物（PT_STATIC_DIR 或 ../dist），同时在同一端口托管静态资源与 SPA。
- * 房间数据仅存在内存中，进程退出即清空。
+ * 一起听服务。全站一个会话，没有房间号，也没有房主。
+ * HTTP：/health、/pt-service、/room-operate、/parse-text。
+ * WebSocket：/ws，播放状态立刻广播。会话只存在内存中，进程退出即清空。
+ * 若存在前端构建产物（PT_STATIC_DIR 或 ../dist），同时托管静态资源与 SPA。
  */
 import http from "node:http"
 import fs from "node:fs"
 import path from "node:path"
-import { fileURLToPath } from "node:url"
-import { randomBytes } from "node:crypto"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { WebSocketServer } from "ws"
 import { parseText } from "./parse-text.mjs"
+import {
+  createSession,
+  normalizeClientId,
+  PLAYING_SWEEP_MS,
+} from "./session.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const defaultDist = path.resolve(__dirname, "../dist")
@@ -19,87 +23,27 @@ const staticDir = process.env.PT_STATIC_DIR
   : (fs.existsSync(path.join(defaultDist, "index.html")) ? defaultDist : "")
 const serveStatic = Boolean(staticDir)
 const PORT = Number(process.env.PORT || process.env.PT_LOCAL_PORT || (serveStatic ? 3000 : 8787))
-const MAX_ROOM_NUM = 15
-const MIN_DURATION_FOR_A_PERSON = 250
-const SPEED_RATES = new Set(["0.8", "1", "1.2", "1.5", "1.7"])
-
-const defaultRoomCfg = { everyoneCanOperatePlayer: "Y" }
-
-/** @type {Map<string, any>} */
-const rooms = new Map()
-
-function now() {
-  return Date.now()
-}
-
-function makeId(bytes = 8) {
-  return randomBytes(bytes).toString("hex")
-}
-
-function generateGuestId(participants) {
-  const ABC = "abcdefghijkmnopqrstuvwyz123456789"
-  const ids = new Set(participants.map((v) => v.guestId))
-  for (let t = 0; t < 20; t++) {
-    let s = ""
-    for (let i = 0; i < 11; i++) s += ABC[Math.floor(Math.random() * ABC.length)]
-    if (!ids.has(s)) return s
-  }
-  return makeId(6)
-}
-
-function publicRoom(room, extra = {}) {
-  return {
-    roomId: room._id,
-    content: room.content,
-    playStatus: room.playStatus,
-    speedRate: room.speedRate,
-    operator: room.operator,
-    contentStamp: room.contentStamp,
-    operateStamp: room.operateStamp,
-    participants: (room.participants || []).map((v) => ({
-      nickName: v.nickName,
-      guestId: v.guestId,
-      heartbeatStamp: v.heartbeatStamp,
-      enterStamp: v.enterStamp,
-    })),
-    everyoneCanOperatePlayer: (room.config || defaultRoomCfg).everyoneCanOperatePlayer,
-    ...extra,
-  }
-}
-
-function pausePlayer(room, operator = "") {
-  if (room.playStatus === "PAUSED") return room
-  room.playStatus = "PAUSED"
-  const participants = room.participants || []
-  let { operateStamp, speedRate, contentStamp } = room
-  let speedRateNum = Number(speedRate)
-  if (isNaN(speedRateNum) || speedRateNum >= 1.71) speedRateNum = 1
-  if (participants.length > 0) {
-    let lastHeartbeat = operateStamp
-    for (const p of participants) {
-      if (p.heartbeatStamp > lastHeartbeat) lastHeartbeat = p.heartbeatStamp
-    }
-    room.contentStamp = contentStamp + (lastHeartbeat - operateStamp) * speedRateNum
-    room.operateStamp = now()
-    room.operator = operator
-  }
-  return room
-}
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
-    req.on("data", (c) => {
-      size += c.length
+    let failed = false
+    req.on("data", (chunk) => {
+      if (failed) return
+      size += chunk.length
       if (size > 1_000_000) {
-        reject(new Error("body too large"))
+        failed = true
+        const err = new Error("body too large")
+        err.code = "BODY_TOO_LARGE"
+        reject(err)
         req.destroy()
         return
       }
-      chunks.push(c)
+      chunks.push(chunk)
     })
     req.on("end", () => {
+      if (failed) return
       if (!chunks.length) {
         resolve({})
         return
@@ -110,7 +54,9 @@ function readJson(req) {
         reject(err)
       }
     })
-    req.on("error", reject)
+    req.on("error", (err) => {
+      if (!failed) reject(err)
+    })
   })
 }
 
@@ -122,6 +68,7 @@ function sendJson(res, status, data) {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type",
     "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Cache-Control": "no-store",
   })
   res.end(body)
 }
@@ -135,154 +82,261 @@ function sendCors(res) {
   res.end()
 }
 
-function handleCreate(body) {
-  const clientId = body["x-pt-local-id"]
-  const roomData = body.roomData
-  if (!roomData || roomData.infoType !== "podcast" || !roomData.audioUrl) {
-    return { code: "E4000", errMsg: "roomData.audioUrl is required" }
+function fail(err) {
+  if (err?.code === "BODY_TOO_LARGE") return { code: "E4000", errMsg: "BODY_TOO_LARGE" }
+  if (err instanceof SyntaxError) return { code: "E4000", errMsg: "BAD_JSON" }
+  return null
+}
+
+export function createApp(options = {}) {
+  const session = options.session || createSession(options.now)
+  const fetchImpl = options.fetchImpl || globalThis.fetch
+  let closed = false
+
+  const server = http.createServer(async (req, res) => {
+    const urlPath = (req.url || "/").split("?")[0]
+    if (req.method === "OPTIONS") {
+      sendCors(res)
+      return
+    }
+    if (req.method === "GET" && urlPath === "/health") {
+      sendJson(res, 200, {
+        ok: true,
+        stamp: Date.now(),
+        participants: session.participantCount(),
+        hasContent: session.hasContent(),
+      })
+      return
+    }
+    if (req.method === "GET" && urlPath.startsWith("/demo/")) {
+      serveDemo(req, res)
+      return
+    }
+
+    try {
+      if (urlPath === "/pt-service") {
+        if (req.method !== "POST") {
+          sendJson(res, 200, { code: "E4005", errMsg: "METHOD_NOT_ALLOWED" })
+          return
+        }
+        sendJson(res, 200, { code: "0000", data: { stamp: Date.now() } })
+        return
+      }
+
+      const body = req.method === "POST" ? await readJson(req) : {}
+      if (urlPath === "/room-operate") {
+        sendJson(res, 200, await handleRoomOperate(body, req.method))
+        return
+      }
+      if (urlPath === "/parse-text") {
+        sendJson(res, 200, await handleParseText(body, req.method))
+        return
+      }
+      if (tryServeStatic(req, res)) return
+      sendJson(res, 404, { code: "E4004", errMsg: "NOT_FOUND" })
+    } catch (err) {
+      const known = fail(err)
+      if (known) {
+        sendJson(res, 200, known)
+        return
+      }
+      console.error("http error:", err)
+      sendJson(res, 500, { code: "E5000", errMsg: "SERVER_ERROR" })
+    }
+  })
+
+  const wss = new WebSocketServer({
+    server,
+    path: "/ws",
+    maxPayload: 64 * 1024,
+    perMessageDeflate: false,
+  })
+
+  function wsSend(socket, obj) {
+    if (socket.readyState === 1) socket.send(JSON.stringify(obj))
   }
-  // 同一位房主再建新房时，关掉旧房（与原云函数一致）
-  for (const [id, room] of rooms) {
-    if (room.oState === "OK" && room.owner === clientId) {
-      pausePlayer(room)
-      room.oState = "DELETED"
-      room.participants = []
-      rooms.set(id, room)
+
+  function broadcast(obj) {
+    const msg = JSON.stringify(obj)
+    for (const socket of wss.clients) {
+      if (socket.readyState === 1 && socket.joined) socket.send(msg)
     }
   }
-  const id = makeId(12)
-  const stamp = now()
-  const room = {
-    _id: id,
-    content: roomData,
-    oState: "OK",
-    playStatus: "PAUSED",
-    speedRate: "1",
-    contentStamp: 0,
-    operateStamp: stamp,
-    operator: "",
-    createStamp: stamp,
-    owner: clientId,
-    participants: [],
-    config: { ...defaultRoomCfg },
+
+  function rejectSocket(socket, payload, closeCode) {
+    wsSend(socket, { responseType: "ERROR", ...payload })
+    socket.close(closeCode, payload.errMsg || "ERROR")
   }
-  rooms.set(id, room)
-  return { code: "0000", data: publicRoom(room) }
-}
 
-function handleEnter(body) {
-  const clientId = body["x-pt-local-id"]
-  const { roomId, nickName } = body
-  const room = rooms.get(roomId)
-  if (!room || room.oState === "DELETED") return { code: "E4004" }
-  if (room.oState === "EXPIRED") return { code: "E4006" }
-
-  const stamp = now()
-  let me = room.participants.find((v) => v.nonce === clientId)
-  let guestId = ""
-  if (me) {
-    guestId = me.guestId
-    me.nickName = nickName
-    me.enterStamp = stamp
-    me.heartbeatStamp = stamp
-  } else {
-    if (room.participants.length >= MAX_ROOM_NUM) return { code: "R0001" }
-    guestId = generateGuestId(room.participants)
-    me = {
-      nickName,
-      enterStamp: stamp,
-      heartbeatStamp: stamp,
-      guestId,
-      nonce: clientId,
+  async function handleSetContent(clientId, body) {
+    if (!session.snapshotFor(clientId)) {
+      return { code: "E4003", errMsg: "NOT_IN_SESSION", showMsg: "请先加入一起听" }
     }
-    room.participants.push(me)
-  }
-  room.participants = room.participants.filter((v) => stamp - v.heartbeatStamp < 60 * 1000)
-  return {
-    code: "0000",
-    data: publicRoom(room, {
-      guestId,
-      iamOwner: room.owner === clientId ? "Y" : "N",
-    }),
-  }
-}
-
-function handleHeartbeat(body) {
-  const clientId = body["x-pt-local-id"]
-  const { roomId, nickName } = body
-  const room = rooms.get(roomId)
-  if (!room || room.oState === "DELETED") return { code: "E4004" }
-  if (room.oState === "EXPIRED") return { code: "E4006" }
-  const stamp = now()
-  const me = room.participants.find((v) => v.nonce === clientId)
-  if (!me) return { code: "E4003" }
-  me.heartbeatStamp = stamp
-  me.nickName = nickName
-  room.participants = room.participants.filter((v) => stamp - v.heartbeatStamp < 50 * 1000)
-  return { code: "0000", data: publicRoom(room) }
-}
-
-function handleLeave(body) {
-  const clientId = body["x-pt-local-id"]
-  const { roomId } = body
-  const room = rooms.get(roomId)
-  if (!room || room.oState === "DELETED") return { code: "E4004" }
-  if (room.oState === "EXPIRED") return { code: "E4006" }
-  if (room.participants.length < 1) return { code: "0000" }
-  const me = room.participants.find((v) => v.nonce === clientId)
-  if (!me) return { code: "E4003" }
-  if (room.participants.length === 1) {
-    pausePlayer(room)
-    room.participants = []
-    return { code: "0000" }
-  }
-  room.participants = room.participants.filter((v) => v.nonce !== clientId)
-  return { code: "0000" }
-}
-
-function handleRoomOperate(body, method) {
-  if (method !== "POST") return { code: "E4005" }
-  const localId = body["x-pt-local-id"]
-  if (!localId) return { code: "E4000" }
-  const { operateType = "", nickName, roomId } = body
-  const oTypes = ["CREATE", "ENTER", "HEARTBEAT", "LEAVE"]
-  if (!oTypes.includes(operateType)) return { code: "E4000" }
-  if (!nickName && operateType !== "CREATE") return { code: "E4000" }
-  if (!roomId && operateType !== "CREATE") return { code: "E4000" }
-  if (operateType === "CREATE") return handleCreate(body)
-  if (operateType === "ENTER") return handleEnter(body)
-  if (operateType === "HEARTBEAT") return handleHeartbeat(body)
-  if (operateType === "LEAVE") return handleLeave(body)
-  return { code: "E4044" }
-}
-
-function cleanupPlayingRooms() {
-  const stamp = now()
-  for (const room of rooms.values()) {
-    if (room.oState !== "OK" || room.playStatus !== "PLAYING") continue
-    const oldLen = room.participants.length
-    if (oldLen < 1) {
-      room.playStatus = "PAUSED"
-      continue
+    if (typeof body?.link !== "string" || !body.link.trim()) {
+      return { code: "E4000", errMsg: "BAD_LINK" }
     }
-    let lastHeartbeat = 1
-    room.participants = room.participants.filter((p) => {
-      if (p.heartbeatStamp > lastHeartbeat) lastHeartbeat = p.heartbeatStamp
-      return p.heartbeatStamp > stamp - 50 * 1000
+    const parsed = await parseText(body.link, fetchImpl)
+    if (parsed.code !== "0000") return parsed
+    const saved = session.setContent(clientId, parsed.data)
+    if (saved.code === "0000") {
+      broadcast({
+        responseType: "NEW_CONTENT",
+        content: saved.data.content,
+        roomStatus: {
+          playStatus: saved.data.playStatus,
+          speedRate: saved.data.speedRate,
+          operator: saved.data.operator,
+          contentStamp: saved.data.contentStamp,
+          operateStamp: saved.data.operateStamp,
+        },
+      })
+    }
+    return saved
+  }
+
+  async function handleRoomOperate(body, method) {
+    if (method !== "POST") return { code: "E4005", errMsg: "METHOD_NOT_ALLOWED" }
+    const clientId = normalizeClientId(body?.["x-pt-local-id"])
+    if (!clientId) return { code: "E4000", errMsg: "BAD_LOCAL_ID" }
+    const operateType = body.operateType
+    if (operateType === "CREATE") return { code: "E4000", errMsg: "CREATE_REMOVED" }
+    if (operateType === "ENTER") return session.enter(clientId)
+    if (operateType === "HEARTBEAT") return session.heartbeat(clientId)
+    if (operateType === "LEAVE") return session.leave(clientId)
+    if (operateType === "SET_CONTENT") return handleSetContent(clientId, body)
+    return { code: "E4000", errMsg: "BAD_OPERATE" }
+  }
+
+  async function handleParseText(body, method) {
+    if (method !== "POST") return { code: "E4005", errMsg: "METHOD_NOT_ALLOWED" }
+    const clientId = normalizeClientId(body?.["x-pt-local-id"])
+    if (!clientId) return { code: "E4000", errMsg: "BAD_LOCAL_ID" }
+    if (typeof body?.link !== "string" || !body.link.trim()) {
+      return { code: "E4000", errMsg: "BAD_LINK" }
+    }
+    return parseText(body.link, fetchImpl)
+  }
+
+  function handleWsMessage(socket, data) {
+    let req
+    try {
+      req = JSON.parse(String(data))
+    } catch {
+      socket.close(1003, "BAD_JSON")
+      return
+    }
+    const operateType = req?.operateType
+    const clientId = normalizeClientId(req?.["x-pt-local-id"])
+    const stamp = req?.["x-pt-stamp"]
+    if (!operateType || !clientId || typeof stamp !== "number" || !Number.isFinite(stamp)) {
+      rejectSocket(socket, { code: "E4000", errMsg: "BAD_MESSAGE" }, 4000)
+      return
+    }
+    if (socket.joined && socket.clientId !== clientId) {
+      rejectSocket(socket, { code: "E4000", errMsg: "BAD_LOCAL_ID" }, 4000)
+      return
+    }
+
+    if (operateType === "HEARTBEAT") {
+      if (!socket.joined) {
+        rejectSocket(socket, { code: "E4000", errMsg: "NEED_FIRST_SEND" }, 4000)
+        return
+      }
+      wsSend(socket, { responseType: "HEARTBEAT" })
+      return
+    }
+
+    if (operateType === "FIRST_SEND") {
+      const snap = session.snapshotFor(clientId)
+      if (!snap) {
+        rejectSocket(socket, {
+          code: "E4003",
+          errMsg: "NOT_IN_SESSION",
+          showMsg: "请先加入一起听",
+        }, 4003)
+        return
+      }
+      socket.joined = true
+      socket.clientId = clientId
+      wsSend(socket, {
+        responseType: "NEW_STATUS",
+        content: snap.content,
+        roomStatus: snap.roomStatus,
+      })
+      return
+    }
+
+    if (operateType === "SET_PLAYER") {
+      if (!socket.joined) {
+        rejectSocket(socket, { code: "E4000", errMsg: "NEED_FIRST_SEND" }, 4000)
+        return
+      }
+      if (!req.playStatus || req.speedRate == null || typeof req.contentStamp !== "number") {
+        rejectSocket(socket, { code: "E4000", errMsg: "BAD_PLAYER" }, 4000)
+        return
+      }
+      const result = session.setPlayer(clientId, stamp, req)
+      if (result.code === "E4003") {
+        rejectSocket(socket, result, 4003)
+        return
+      }
+      if (result.code === "0000") {
+        broadcast({ responseType: "NEW_STATUS", roomStatus: result.roomStatus })
+      }
+      return
+    }
+
+    rejectSocket(socket, { code: "E4000", errMsg: "BAD_OPERATE" }, 4000)
+  }
+
+  wss.on("connection", (socket) => {
+    socket.joined = false
+    socket.clientId = ""
+    socket.on("error", () => {})
+    wsSend(socket, { responseType: "CONNECTED" })
+    socket.on("message", (data) => {
+      try {
+        handleWsMessage(socket, data)
+      } catch (err) {
+        console.error("ws message error:", err)
+      }
     })
-    if (room.participants.length === oldLen) continue
-    if (room.participants.length === 0) {
-      let speedRateNum = Number(room.speedRate)
-      if (isNaN(speedRateNum) || speedRateNum >= 1.71) speedRateNum = 1
-      room.playStatus = "PAUSED"
-      room.contentStamp = room.contentStamp + (lastHeartbeat - room.operateStamp) * speedRateNum
-      room.operateStamp = stamp
-      room.operator = ""
-    }
-  }
-}
+    // 这里不调用 leave。套接字掉线后，同一个人还能用原来的 x-pt-local-id
+    // 在心跳时限内重连，不会被立刻踢出，也不会占第二个名额。
+  })
 
-setInterval(cleanupPlayingRooms, 30_000)
+  const timer = setInterval(() => {
+    session.cleanupPlaying()
+  }, PLAYING_SWEEP_MS)
+  if (typeof timer.unref === "function") timer.unref()
+
+  function close() {
+    if (closed) return Promise.resolve()
+    closed = true
+    clearInterval(timer)
+    for (const socket of wss.clients) {
+      try { socket.terminate() } catch { /* already gone */ }
+    }
+    return new Promise((resolve) => {
+      let settled = false
+      const done = () => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
+      wss.close()
+      if (!server.listening) {
+        done()
+        return
+      }
+      server.close(done)
+      server.closeAllConnections?.()
+      setTimeout(done, 2000).unref?.()
+    })
+  }
+
+  return { server, session, close }
+}
 
 function serveDemo(req, res) {
   const name = decodeURIComponent(req.url.split("?")[0].replace(/^\/demo\//, ""))
@@ -309,7 +363,6 @@ function serveDemo(req, res) {
   })
   fs.createReadStream(file).pipe(res)
 }
-
 
 const STATIC_MIME = {
   ".html": "text/html; charset=utf-8",
@@ -363,7 +416,6 @@ function tryServeStatic(req, res) {
       stat = fs.statSync(file)
     } else {
       const ext = path.extname(file)
-      // Hashed or real assets that are missing should 404; route navigations fall back to SPA.
       if (ext && ext !== ".html") {
         res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" })
         res.end("Not found")
@@ -399,181 +451,20 @@ function tryServeStatic(req, res) {
   return true
 }
 
-const server = http.createServer(async (req, res) => {
-  const urlPath = (req.url || "/").split("?")[0]
-  if (req.method === "OPTIONS") {
-    sendCors(res)
-    return
-  }
-  if (req.method === "GET" && urlPath === "/health") {
-    sendJson(res, 200, { ok: true, rooms: rooms.size, stamp: now() })
-    return
-  }
-  if (req.method === "GET" && urlPath.startsWith("/demo/")) {
-    serveDemo(req, res)
-    return
-  }
-
-  try {
-    if (urlPath === "/pt-service" && req.method === "POST") {
-      sendJson(res, 200, { code: "0000", data: { stamp: now() } })
-      return
-    }
-    const body = req.method === "POST" ? await readJson(req) : {}
-    if (urlPath === "/room-operate") {
-      sendJson(res, 200, handleRoomOperate(body, req.method))
-      return
-    }
-    if (urlPath === "/parse-text") {
-      if (req.method !== "POST") {
-        sendJson(res, 200, { code: "E4005" })
-        return
-      }
-      const { link } = body
-      const clientId = body["x-pt-local-id"]
-      if (!link || !clientId || String(link).indexOf("http") !== 0) {
-        sendJson(res, 200, { code: "E4000" })
-        return
-      }
-      sendJson(res, 200, await parseText(String(link)))
-      return
-    }
-    if (tryServeStatic(req, res)) return
-    sendJson(res, 404, { code: "E4004" })
-  } catch (err) {
-    console.error("http error:", err)
-    sendJson(res, 500, { code: "E5000", errMsg: "server error" })
-  }
-})
-
-const wss = new WebSocketServer({ server, path: "/ws" })
-
-function wsSend(socket, obj) {
-  if (socket.readyState === 1) {
-    socket.send(JSON.stringify(obj))
-  }
+function isMainModule() {
+  const entry = process.argv[1]
+  if (!entry) return false
+  return import.meta.url === pathToFileURL(entry).href
 }
 
-function broadcastRoom(roomId, obj) {
-  const msg = JSON.stringify(obj)
-  for (const socket of wss.clients) {
-    if (socket.readyState === 1 && socket.roomId === roomId) {
-      socket.send(msg)
-    }
-  }
-}
-
-function getOperatorGuestId(clientId, room) {
-  if (!room || room.oState === "EXPIRED" || room.oState === "DELETED") return
-  const me = (room.participants || []).find((v) => v.nonce === clientId)
-  return me?.guestId
-}
-
-function handleWsMessage(socket, data) {
-  let req
-  try {
-    req = JSON.parse(String(data))
-  } catch {
-    socket.close()
-    return
-  }
-  const operateType = req?.operateType
-  const roomId = req?.roomId
-  const clientId = req?.["x-pt-local-id"]
-  const stamp = req?.["x-pt-stamp"]
-  if (!operateType || !roomId || !clientId || !stamp) {
-    socket.close()
-    return
-  }
-
-  if (operateType === "HEARTBEAT") {
-    if (!socket.roomId || socket.roomId !== roomId) {
-      socket.close()
-      return
-    }
-    wsSend(socket, { responseType: "HEARTBEAT" })
-    return
-  }
-
-  if (operateType === "FIRST_SEND") {
-    const room = rooms.get(roomId)
-    const guestId = getOperatorGuestId(clientId, room)
-    if (!guestId) {
-      socket.close()
-      return
-    }
-    socket.roomId = roomId
-    wsSend(socket, {
-      responseType: "NEW_STATUS",
-      roomStatus: {
-        roomId,
-        playStatus: room.playStatus,
-        speedRate: room.speedRate,
-        operator: room.operator,
-        contentStamp: room.contentStamp,
-        operateStamp: room.operateStamp,
-        everyoneCanOperatePlayer: (room.config || defaultRoomCfg).everyoneCanOperatePlayer,
-      },
-    })
-    return
-  }
-
-  if (operateType === "SET_PLAYER") {
-    const { playStatus, speedRate, contentStamp, everyoneCanOperatePlayer } = req
-    if (!playStatus || !speedRate || typeof contentStamp !== "number") {
-      socket.close()
-      return
-    }
-    if (!SPEED_RATES.has(String(speedRate))) return
-    const room = rooms.get(roomId)
-    if (!room) return
-    const roomCfg = room.config || { ...defaultRoomCfg }
-    const isOwner = room.owner === clientId
-    if (!isOwner && roomCfg.everyoneCanOperatePlayer === "N") return
-    const guestId = getOperatorGuestId(clientId, room)
-    if (!guestId) {
-      socket.close()
-      return
-    }
-    if (guestId === room.operator && stamp - room.operateStamp < MIN_DURATION_FOR_A_PERSON) return
-
-    room.playStatus = playStatus
-    room.speedRate = String(speedRate)
-    room.contentStamp = contentStamp
-    room.operateStamp = stamp
-    room.operator = guestId
-    const roomStatus = {
-      roomId,
-      playStatus,
-      speedRate: room.speedRate,
-      contentStamp,
-      operateStamp: stamp,
-      operator: guestId,
-    }
-    if (everyoneCanOperatePlayer && isOwner) {
-      roomStatus.everyoneCanOperatePlayer = everyoneCanOperatePlayer
-      roomCfg.everyoneCanOperatePlayer = everyoneCanOperatePlayer
-      room.config = roomCfg
-    }
-    broadcastRoom(roomId, { responseType: "NEW_STATUS", roomStatus })
-  }
-}
-
-wss.on("connection", (socket) => {
-  socket.createStamp = now()
-  wsSend(socket, { responseType: "CONNECTED" })
-  socket.on("message", (data) => {
-    try {
-      handleWsMessage(socket, data)
-    } catch (err) {
-      console.error("ws message error:", err)
-    }
+if (isMainModule()) {
+  const { server } = createApp()
+  server.listen(PORT, "0.0.0.0", () => {
+    const address = server.address()
+    const actualPort = address && typeof address === "object" ? address.port : PORT
+    console.log(`[local-server] http://0.0.0.0:${actualPort}`)
+    console.log(`[local-server] websocket ws://0.0.0.0:${actualPort}/ws`)
+    if (serveStatic) console.log(`[local-server] static      ${staticDir}`)
+    console.log(`[local-server] demo audio  /demo/tone.mp3`)
   })
-})
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[local-server] http://0.0.0.0:${PORT}`)
-  console.log(`[local-server] websocket ws://0.0.0.0:${PORT}/ws`)
-  if (serveStatic) console.log(`[local-server] static      ${staticDir}`)
-  console.log(`[local-server] demo audio  /demo/tone.mp3`)
-})
+}
