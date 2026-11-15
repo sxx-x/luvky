@@ -4,7 +4,7 @@
   "start_url": "/",
   "name": "一起听播客",
   "short_name": "一起听播客",
-  "description": "一起跟好友听播客吧！",
+  "description": "一起听播客",
   "theme_color": "#282828",
   "background_color": "#181818",
   "orientation": "any",
@@ -55,15 +55,6 @@
     }
   ],
   "lang": "zh-CN",
-  "share_target": {
-    "action": "/create",
-    "method": "GET",
-    "params": {
-      "title": "title",
-      "text": "text",
-      "url": "link"
-    }
-  },
   "features": [
     "Podcast",
     "listening together",
@@ -73,32 +64,6 @@
   "categories": [
     "utility",
     "music"
-  ],
-  "shortcuts": [
-    {
-      "name": "创建房间",
-      "short_name": "创建",
-      "url": "/create",
-      "description": "创建新房间",
-      "icons": [
-        {
-          "src": "pwa/ic_add.png",
-          "sizes": "96x96"
-        }
-      ]
-    },
-    {
-      "name": "联系开发者",
-      "short_name": "联系",
-      "url": "/contact",
-      "description": "立即加群，一起听播客！",
-      "icons": [
-        {
-          "src": "pwa/ic_phone.png",
-          "sizes": "96x96"
-        }
-      ]
-    }
   ],
   "screenshots": [
     {

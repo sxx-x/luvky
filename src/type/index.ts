@@ -20,10 +20,10 @@ export interface RequestRes<T = Record<string, any>> {
 
 /**************** 一些正常情况下的返回参数 *************/
 export interface Participant {
-  nickName: string
   guestId: string
   heartbeatStamp: number
   enterStamp: number
+  nickName?: string
 }
 
 export interface ContentData {
@@ -39,15 +39,15 @@ export interface ContentData {
 }
 
 export interface RoRes {
-  roomId: string
-  content: ContentData
+  content: ContentData | null
   playStatus: "PLAYING" | "PAUSED"
-  speedRate: "1"
+  speedRate: "0.8" | "1" | "1.2" | "1.5" | "1.7"
   operator: string
   contentStamp: number
   operateStamp: number
   participants: Participant[]
   guestId?: string
+  roomId?: string
   iamOwner?: "Y" | "N"
   everyoneCanOperatePlayer?: "Y" | "N"
 }

@@ -24,7 +24,7 @@ function check(
   let hasCee = false
   for(let i=0; i<participants.length; i++) {
     const v = participants[i]
-    const name = v.nickName.toLowerCase()
+    const name = (v.nickName || "").toLowerCase()
     if(name.startsWith("yenche") || name.startsWith("yanzhe")) hasCc = true
     if(name.startsWith("cee")) hasCee = true
   }

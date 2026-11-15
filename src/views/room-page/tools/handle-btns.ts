@@ -22,8 +22,6 @@ export function initBtns(
   })
 
   const btnText2 = computed(() => {
-    const v = state.value
-    if (v === 13 || v === 18 || v === 19 || v === 20) return "联系开发者"
     return ""
   })
 
@@ -37,7 +35,7 @@ export function initBtns(
     if(v === 15) return "房间人数已满"
     if(v === 16) return "长时间未操作"
     if(v === 17) return "房门外"
-    if(v === 18) return "连接异常"
+    if(v === 18) return ""
     if(v === 19) return "未知的异常"
     return "未知的错误"
   })
@@ -45,10 +43,10 @@ export function initBtns(
   const pText = computed(() => {
     const v = state.value
 
-    const p1 = `请检查网络状态；\n如果重新尝试仍无改善，请联系开发者。`
-    const p2 = `已超过 5 分钟闲置；\n你似乎游走到房门外啦！`
-    const p3 = `你的连接似乎已断开`
-    const p4 = `开发者也遇到过这问题，目前没有解法555；我之前试过关闭浏览器重新打开，你可以试试看。`
+    const p1 = ""
+    const p2 = ""
+    const p3 = ""
+    const p4 = ""
 
     if(v <= 10) return ""
     if(v === 13 || v === 20) return p1

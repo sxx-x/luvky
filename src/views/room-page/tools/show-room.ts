@@ -15,7 +15,7 @@ export const showParticipants = (participants: Participant[], myGuestId: string)
   list = participants.map(v => {
     let obj: PageParticipant = {
       guestId: v.guestId,
-      nickName: v.nickName,
+      nickName: v.nickName || "",
       enterStr: "",
       isMe: v.guestId === myGuestId,
     }
