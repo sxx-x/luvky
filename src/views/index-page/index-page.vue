@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import "shikwasa2/dist/shikwasa.min.css"
-import { computed, nextTick, ref, watch } from "vue"
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue"
 import { useRoomPage } from "../room-page/tools/useRoomPage"
 import { extractXiaoyuzhouEpisodeLink } from "./tools/episode-link"
+import { sampleCoverEdge } from "./tools/cover-edge"
 import { useAddToHomeScreen } from "./tools/useAddToHomeScreen"
 import ptApi from "../../utils/pt-api"
 import cui from "../../components/custom-ui"
 
 const SAME_URL = "https://luvky.top"
+const EMPTY_EDGE = "#f3efe9"
+const PLAYING_EDGE = "#161210"
 
 const isWeChat = ptApi.getCharacteristic().isWeChat
 const { pageData, playerEl, submitEpisode, onTapSyncGate } = useRoomPage()
@@ -28,13 +31,70 @@ const washStyle = computed(() => {
   return { backgroundImage: `url("${url}")` }
 })
 
-watch(hasAudio, (playing) => {
-  const color = playing ? "#161210" : "#f3efe9"
+function paintEdge(color: string) {
+  const root = document.documentElement
+  root.style.setProperty("--listen-edge", color)
+  root.style.backgroundColor = color
+  document.body.style.backgroundColor = color
   document.querySelectorAll('meta[name="theme-color"]').forEach((node) => {
     node.setAttribute("content", color)
   })
+}
+
+function onPlayingSurface() {
+  return hasAudio.value && !isWeChat && pageData.state !== 15
+}
+
+let edgeTicket = 0
+function refreshEdge(reset: boolean) {
+  const ticket = ++edgeTicket
+  if (!onPlayingSurface()) {
+    paintEdge(EMPTY_EDGE)
+    return
+  }
+  if (reset) paintEdge(PLAYING_EDGE)
+  const url = coverUrl.value.replace(/[\n\r"\\]/g, "")
+  const viewport = { width: window.innerWidth, height: window.innerHeight }
+  void sampleCoverEdge(url, viewport).then((color) => {
+    if (ticket !== edgeTicket || !onPlayingSurface()) return
+    paintEdge(color || PLAYING_EDGE)
+  })
+}
+
+watch(hasAudio, (playing) => {
   if (!playing) revealEntry.value = false
+  refreshEdge(true)
 }, { immediate: true })
+
+watch(coverUrl, () => {
+  if (onPlayingSurface()) refreshEdge(false)
+})
+
+watch(() => pageData.state, (_state, prev) => {
+  const wasPlaying = hasAudio.value && !isWeChat && prev !== 15
+  refreshEdge(onPlayingSurface() && !wasPlaying)
+})
+
+let edgeResize = 0
+function onViewportResize() {
+  window.clearTimeout(edgeResize)
+  edgeResize = window.setTimeout(() => {
+    if (onPlayingSurface()) refreshEdge(false)
+  }, 120)
+}
+
+onMounted(() => {
+  window.addEventListener("resize", onViewportResize)
+  window.visualViewport?.addEventListener("resize", onViewportResize)
+})
+
+onUnmounted(() => {
+  window.removeEventListener("resize", onViewportResize)
+  window.visualViewport?.removeEventListener("resize", onViewportResize)
+  window.clearTimeout(edgeResize)
+  edgeTicket++
+  paintEdge(EMPTY_EDGE)
+})
 
 function submitOrWarn(text: string) {
   const link = extractXiaoyuzhouEpisodeLink(text)
@@ -540,6 +600,19 @@ async function onTapShare() {
 </style>
 
 <style lang="scss">
+/* The cover wash is clipped to the layout viewport. On iPhone 13+ the
+   standalone viewport stops short of the glass by the status-bar inset, and
+   iOS paints that band with the root background. --listen-edge is the wash
+   color at the seam, so the band continues the cover tint. Empty stays cream. */
+html:has(.listen-page.is-empty),
+html:has(.gate-screen) {
+  background-color: #f3efe9;
+}
+
+html:has(.listen-page.is-playing) {
+  background-color: var(--listen-edge, #161210);
+}
+
 body:has(.listen-page),
 body:has(.gate-screen) {
   padding: 0;
@@ -547,7 +620,7 @@ body:has(.gate-screen) {
 }
 
 body:has(.listen-page.is-playing) {
-  background: #161210;
+  background-color: var(--listen-edge, #161210);
 }
 
 .classic-theme:has(.listen-page.is-empty),
@@ -558,7 +631,7 @@ body:has(.listen-page.is-playing) {
 
 .classic-theme:has(.listen-page.is-playing),
 .classic-theme.dark-theme:has(.listen-page.is-playing) {
-  background: #161210;
+  background-color: var(--listen-edge, #161210);
 }
 
 /* Shikwasa hides .shk-cover under 640px and pins the player to the bottom.

@@ -12,8 +12,8 @@
     "dev:vite": "vite",
     "dev:local": "node scripts/dev-local.mjs",
     "server": "node local-server/index.mjs",
-    "test": "node --test local-server/session.test.mjs local-server/parse-text.test.mjs local-server/smoke-test.mjs",
-    "test:sync": "node --test local-server/session.test.mjs local-server/parse-text.test.mjs local-server/smoke-test.mjs"
+    "test": "node --test local-server/session.test.mjs local-server/parse-text.test.mjs local-server/smoke-test.mjs local-server/cover-edge.test.mjs",
+    "test:sync": "node --test local-server/session.test.mjs local-server/parse-text.test.mjs local-server/smoke-test.mjs local-server/cover-edge.test.mjs"
   },
   "engines": {
     "node": ">=20"
