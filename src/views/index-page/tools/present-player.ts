@@ -4,16 +4,19 @@
  * Lock-screen artwork and Media Session handlers stay where they are.
  */
 
+/* Ring and arrow arc are both circles centered at (18, 18). The arc used to
+   sit on a center near (16.47, 18.20) / its mirror, which made the glyph crooked.
+   Endpoints and the arrowhead are that same shape, translated onto the ring. */
 const BACK_SVG = `<svg aria-hidden="true" viewBox="0 0 36 36" fill="none">
   <circle cx="18" cy="18" r="15.25" stroke="currentColor" stroke-width="1.6"/>
-  <path d="M16.2 8.6 A9.6 9.6 0 1 0 25.2 14.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-  <path d="M16.6 8.2 L13.4 10.8 L17.6 12.2" fill="currentColor"/>
+  <path d="M17.729 8.404 A9.6 9.6 0 1 0 26.729 14.004" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M18.129 8.004 L14.929 10.604 L19.129 12.004" fill="currentColor"/>
 </svg>`
 
 const FWD_SVG = `<svg aria-hidden="true" viewBox="0 0 36 36" fill="none">
   <circle cx="18" cy="18" r="15.25" stroke="currentColor" stroke-width="1.6"/>
-  <path d="M19.8 8.6 A9.6 9.6 0 1 1 10.8 14.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
-  <path d="M19.4 8.2 L22.6 10.8 L18.4 12.2" fill="currentColor"/>
+  <path d="M18.271 8.404 A9.6 9.6 0 1 1 9.271 14.004" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+  <path d="M17.871 8.004 L21.071 10.604 L16.871 12.004" fill="currentColor"/>
 </svg>`
 
 const PLAY_SVG = `<svg class="shk-btn_play" aria-hidden="true" viewBox="0 0 28 28">
