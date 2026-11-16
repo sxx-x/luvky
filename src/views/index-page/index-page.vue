@@ -474,15 +474,17 @@ async function onTapShare() {
 }
 
 .is-playing .btn-share {
-  color: rgba(244, 240, 234, 0.86);
-  border-color: rgba(244, 240, 234, 0.3);
-  min-height: 48px;
-  font-size: 16px;
+  background: transparent;
+  border: 0;
+  color: rgba(244, 240, 234, 0.52);
+  min-height: 44px;
+  font-size: 15px;
   font-weight: 500;
 }
 
 .is-playing .btn-share:active {
-  background: rgba(244, 240, 234, 0.06);
+  background: transparent;
+  color: rgba(244, 240, 234, 0.78);
 }
 
 .btn-swap {
@@ -700,7 +702,7 @@ body:has(.listen-page.is-playing) {
 
 .listen-page .shk-text {
   order: 2;
-  margin: 20px 4px 0;
+  margin: 14px 4px 0;
   width: auto;
   max-width: 100%;
   overflow: hidden;
@@ -731,9 +733,9 @@ body:has(.listen-page.is-playing) {
 .listen-page .shk-title_wrap[data-overflow] .shk-title_inner:after {
   animation: none !important;
   color: #f4f0ea;
-  font-size: 20px;
-  line-height: 1.3;
-  font-weight: 700;
+  font-size: 17px;
+  line-height: 1.25;
+  font-weight: 600;
   white-space: normal;
 }
 
@@ -742,9 +744,9 @@ body:has(.listen-page.is-playing) {
 }
 
 .listen-page .shk-artist_wrap {
-  margin-top: 6px;
+  margin-top: 4px;
   font-size: 16px;
-  line-height: 1.4;
+  line-height: 1.35;
 }
 
 .listen-page .shk-artist {
@@ -923,6 +925,10 @@ body:has(.listen-page.is-playing) {
 
 .listen-page .shk-btn_backward,
 .listen-page .shk-btn_forward {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   width: 52px;
   height: 52px;
   padding: 0;
@@ -940,8 +946,9 @@ body:has(.listen-page.is-playing) {
   position: absolute;
   left: 50%;
   top: 50%;
+  /* Digit ink sits high in the em box. -46% lands that ink on the shared center. */
   transform: translate(-50%, -46%);
-  font-family: Inter, "PingFang SC", sans-serif;
+  font-family: Inter, "PingFang SC", -apple-system, sans-serif;
   font-size: 9px;
   font-weight: 650;
   line-height: 1;
