@@ -1,6 +1,7 @@
 import Shikwasa from "shikwasa2"
 import { Ref } from "vue"
 import playerTool from "./player-tool"
+import { presentPlayer } from "../../index-page/tools/present-player"
 
 export interface PlayerCallbacks {
   durationchange?: (duration?: number) => void
@@ -29,10 +30,13 @@ export function initPlayer(
   let player = new Shikwasa({
     container: () => playerEl.value,
     audio: audioData,
-    themeColor: "var(--text-color)",
+    theme: "light",
+    themeColor: "#f4f0ea",
+    fixed: { type: "static", position: "bottom" },
     speedOptions: playerTool.initSpeedOptions(),
     onBeforeClick,
   })
+  presentPlayer(player)
 
   player.on("audioupdate", (e: Event) => {})
 
