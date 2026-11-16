@@ -1,155 +1,129 @@
 /**
- * @file 房间处理主逻辑
- * @author yenche123 <tsuiyenche@outlook.com>
- * @copyright TSUI YEN-CHE 2022
+ * One shared listening session.
+ * Seat identity is the localStorage nonce sent as x-pt-local-id.
+ * HTTP HEARTBEAT holds the seat. Mute and volume stay on this device.
  */
 import { ref, reactive, onActivated, onDeactivated, nextTick } from "vue"
-import { PageData, PageState, WsMsgRes, RoomStatus, PlayStatus, RevokeType } from "../../../type/type-room-page"
+import { PageData, WsMsgRes, RoomStatus, PlayStatus, RevokeType } from "../../../type/type-room-page"
 import { ContentData, RequestRes, RoRes } from "../../../type"
-import { RouteLocationNormalizedLoaded } from "vue-router"
-import { useRouteAndPtRouter, PtRouter, goHome } from "../../../routes/pt-router"
 import ptUtil from "../../../utils/pt-util"
 import util from "../../../utils/util"
 import time from "../../../utils/time"
 import playerTool from "./player-tool"
-import { showParticipants, handleShowMoreBox } from "./show-room"
 import cui from "../../../components/custom-ui"
 import images from "../../../images"
 import ptApi from "../../../utils/pt-api"
 import { initPlayer } from "./init-player"
 import { initWebSocket, sendToWebSocket, isWsOpen } from "./init-websocket"
-import { shareData } from "./init-share"
-import { request_enter, request_heartbeat, request_leave } from "./room-request"
+import { request_enter, request_heartbeat, request_set_content, isSessionFull, SESSION_FULL_TEXT } from "./room-request"
 import { bindMediaSession, clearMediaSession, enhanceAudioElement, seekPrecise, unlockAudioElement, updatePositionState } from "./media-session"
 
-// 一些常量
-const COLLECT_TIMEOUT = 300    // 收集最新状态的最小间隔
-const MAX_HB_NUM = 960    // 心跳最多轮询次数；如果每 15s 一次，相当于 4hr
+const COLLECT_TIMEOUT = 300
+const RATES = ["0.8", "1", "1.2", "1.5", "1.7"] as const
 
-// 播放器
-let player: any;
+let player: any
 const playerEl = ref<HTMLElement | null>(null)
-let playStatus: PlayStatus = "PAUSED"    // 播放状态
-
-// 路由
-let router: PtRouter
-let route: RouteLocationNormalizedLoaded
-
-// web socket
+let playStatus: PlayStatus = "PAUSED"
 let ws: WebSocket | null = null
 
-// 绑定到页面的数据
 const pageData: PageData = reactive({
-  state: 1,
+  state: 3,
   roomId: "",
+  content: null,
   participants: [],
-  showMoreBox: false,   // 是否要展示 “展开更多” 的按钮
+  showMoreBox: false,
   amIOwner: false,
   everyoneCanOperatePlayer: "Y",
   showSyncGate: false,
+  parsing: false,
+  notice: "",
 })
 
-// 其他杂七杂八的数据
-let nickName: string = ""
-let localId: string = ""
-let guestId: string = ""
-let intervalHb: number = 0      // 维持心跳的 interval 的返回值
-let timeoutCollect: number = 0  // 上报最新播放状态的 timeout 的返回值
-let srcDuration: number = 0     // 资源总时长（秒），如果为 0 代表还没解析出来
-let waitPlayer: Promise<boolean>
-let latestStatus: RoomStatus    // 最新的播放器状态
-let isShowingAutoPlayPolicy: boolean = false  // 当前是否已在展示 autoplay policy 的弹窗
-let heartbeatNum = 0            // 心跳的次数
-let receiveWsNum = 0            // 收到 web-socket 的次数
-let pausedSec = 0               // 已经暂停的秒数
-let audioUnlocked = false       // 是否已用用户手势解锁过音频
-let wsManualClose = false       // 是否为离开房间时主动关闭
+let localId = ""
+let guestId = ""
+let intervalHb = 0
+let timeoutCollect = 0
+let srcDuration = 0
+let waitPlayer: Promise<boolean> = Promise.resolve(false)
+let latestStatus: RoomStatus | undefined
+let isShowingAutoPlayPolicy = false
+let audioUnlocked = false
+let wsManualClose = false
 let wsRetryCount = 0
 let wsReconnectTimer = 0
-let wsCheckToken = 0            // 用来作废过期的连接检查
+let wsCheckToken = 0
 let lifecycleBound = false
-let recovering = false          // 避免恢复流程重入
+let recovering = false
+let entering = false
+let enterRetryTimer = 0
+let playAfterLoad = false
+let wsJoined = false
+let pendingPlay = false
+let playerReadySettled = false
+let playerGen = 0
 
-// 时间戳
-let lastOperateLocalStamp = 0        // 上一个本地设置远端服务器的时间戳
-let lastNewStatusFromWsStamp = 0    // 上一次收到 web-socket NEW_STATUS 的时间戳
-let lastHeartbeatStamp = 0          // 上一次心跳的时间戳
+let lastOperateLocalStamp = 0
+let lastNewStatusFromWsStamp = 0
+let lastHeartbeatStamp = 0
 let lastReConnectWs = 0
 
-// 是否为远端调整播放器状态，如果是，则在监听 player 各回调时不往下执行
 let isRemoteSetSeek = false
 let isRemoteSetPlaying = false
 let isRemoteSetPaused = false
 let isRemoteSetSpeedRate = false
 
-// 播放器准备好的回调
-type SimpleFunc = (param1: boolean) => void
-let playerAlready: SimpleFunc
+type SimpleFunc = (ok: boolean) => void
+let playerAlready: SimpleFunc = () => {}
 
-
-const toHome = () => {
-  goHome(router)
+function inWeChat(): boolean {
+  return ptApi.getCharacteristic().isWeChat
 }
 
-const toContact = () => {
-  router.push({ name: "contact" })
+function ensureLocalId() {
+  const data = ptUtil.getUserData()
+  localId = (data.nonce || "").trim()
 }
 
-// 本地修改我的昵称，再上报远端
-const toEditMyName = async (newName: string) => {
-  if(pageData.state !== 3) return
-  const participants = pageData.participants
-  // 修改视图
-  for(let i=0; i<participants?.length; i++) {
-    const v = participants[i]
-    if(v.isMe) v.nickName = newName
+function canOperatePlayer(): boolean {
+  return true
+}
+
+function currentAudioTime(): number {
+  const t = player?.audio?.currentTime
+  if (typeof t === "number" && Number.isFinite(t)) return t
+  return player?.currentTime ?? 0
+}
+
+function normalizeRate(value: unknown): RoomStatus["speedRate"] {
+  const n = Number(value)
+  const hit = RATES.find((rate) => Math.abs(Number(rate) - n) < 0.05)
+  return hit || "1"
+}
+
+function statusFrom(ro: Partial<RoRes>, override?: Partial<RoomStatus>): RoomStatus {
+  return {
+    playStatus: override?.playStatus || ro.playStatus || "PAUSED",
+    speedRate: normalizeRate(override?.speedRate || ro.speedRate || "1"),
+    operator: override?.operator ?? ro.operator ?? "",
+    contentStamp: override?.contentStamp ?? ro.contentStamp ?? 0,
+    operateStamp: override?.operateStamp ?? ro.operateStamp ?? time.getTime(),
   }
-  nickName = newName
-  // 上报远端
-  // 销毁心跳、再用新的心跳上报
-  await request_heartbeat(pageData.roomId, nickName)
-
-  // 修改缓存
-  let userData = ptUtil.getUserData()
-  userData.nickName = newName
-  ptUtil.setUserData(userData)
-}
-
-const onEveryoneCanOperatePlayerChange = (opt: { checked: boolean }) => {
-  if(!pageData.amIOwner) return
-  pageData.everyoneCanOperatePlayer = opt.checked ? "Y" : "N"
-  collectLatestStatus()
 }
 
 export const useRoomPage = () => {
-  const rr = useRouteAndPtRouter()
-  router = rr.router
-  route = rr.route
-  
   init()
-
-  return { 
-    pageData, 
-    playerEl, 
-    route, 
-    router, 
-    toHome, 
-    toContact, 
-    toEditMyName,
-    onEveryoneCanOperatePlayerChange,
-    onTapSyncGate,
-  }
+  return { pageData, playerEl, submitEpisode, onTapSyncGate }
 }
 
-// 初始化一些东西，比如 onActivated / onDeactivated 
 function init() {
   onActivated(() => {
     bindLifecycle()
-    enterRoom()
+    if (inWeChat()) return
+    void enterRoom()
   })
-
   onDeactivated(() => {
-    leaveRoom()
+    // Dropping the socket does not free the seat. Do not send LEAVE.
+    quietStop()
   })
 }
 
@@ -172,186 +146,332 @@ function unbindLifecycle() {
 }
 
 function onVisibilityChange() {
-  if (document.visibilityState === "visible") {
-    onForeground("visibilitychange")
-  }
+  if (document.visibilityState === "visible") void onForeground()
 }
-
-function onPageShow(ev: PageTransitionEvent) {
-  onForeground(ev.persisted ? "pageshow-bfcache" : "pageshow")
-}
-
-function onOnline() {
-  onForeground("online")
-}
-
+function onPageShow() { void onForeground() }
+function onOnline() { void onForeground() }
 function onWindowFocus() {
-  if (document.visibilityState === "visible") onForeground("focus")
+  if (document.visibilityState === "visible") void onForeground()
 }
 
-async function onForeground(reason: string) {
-  if (pageData.state !== 2 && pageData.state !== 3) return
-  if (document.visibilityState === "hidden") return
-  console.log("foreground recover:", reason)
+async function onForeground() {
+  if (inWeChat() || document.visibilityState === "hidden") return
   await time.calibrateTime()
+  if (pageData.state === 15) {
+    void enterRoom({ soft: true })
+    return
+  }
   await silentRecover()
 }
 
-function canOperatePlayer(): boolean {
-  return pageData.amIOwner || pageData.everyoneCanOperatePlayer !== "N"
+function clearEnterRetry() {
+  if (enterRetryTimer) {
+    clearTimeout(enterRetryTimer)
+    enterRetryTimer = 0
+  }
 }
 
-function currentAudioTime(): number {
-  const t = player?.audio?.currentTime
-  if (typeof t === "number" && Number.isFinite(t)) return t
-  return player?.currentTime ?? 0
+function scheduleEnterRetry() {
+  if (enterRetryTimer) return
+  const delay = pageData.state === 15 ? 8000 : 3000
+  enterRetryTimer = window.setTimeout(() => {
+    enterRetryTimer = 0
+    void enterRoom({ soft: true })
+  }, delay)
 }
 
+export async function enterRoom(opts?: { soft?: boolean }) {
+  if (inWeChat() || entering) return
+  entering = true
+  const soft = !!opts?.soft
+  try {
+    ensureLocalId()
+    if (!localId) return
+    if (!soft) {
+      pageData.showSyncGate = false
+      audioUnlocked = false
+      wsRetryCount = 0
+    }
+    wsManualClose = false
+    const res = await request_enter()
+    handleEnterResult(res, soft)
+  } finally {
+    entering = false
+  }
+}
 
-// 进入房间
-export async function enterRoom() {
-  let roomId: string = route.params.roomId as string
-  pageData.roomId = roomId
-  pageData.state = 1
+function handleEnterResult(res: RequestRes<RoRes> | undefined, soft: boolean) {
+  if (isSessionFull(res)) {
+    markFull(res)
+    return
+  }
+  if (!res || res.code !== "0000" || !res.data) {
+    if (pageData.state !== 15) pageData.state = 3
+    scheduleEnterRetry()
+    return
+  }
+  clearEnterRetry()
+  pageData.state = 3
+  pageData.notice = ""
+  if (!soft) pageData.showSyncGate = false
+  applySnapshot(res.data, false)
+  if (!intervalHb) heartbeat()
+  if (!isWsOpen(ws)) connectWebSocket()
+  else firstSend()
+}
+
+function markFull(res?: { showMsg?: string } | null) {
+  pageData.state = 15
+  pageData.notice = res?.showMsg || SESSION_FULL_TEXT
   pageData.showSyncGate = false
-  pausedSec = 0
-  audioUnlocked = false
-  wsManualClose = false
-  wsRetryCount = 0
-
-  let userData = ptUtil.getUserData()
-  nickName = userData.nickName as string
-  localId = userData.nonce as string
-  
-  let res = await request_enter(roomId, nickName)
-  enterResToErrState(res)
-  if(!res) return
-  let { code, data } = res
-  if(code === "0000") {
-    pageData.state = 2
-    await nextTick()
-    afterEnter(data as RoRes)
-  }
+  pageData.parsing = false
+  playAfterLoad = false
+  quietStop()
+  scheduleEnterRetry()
 }
 
-function enterResToErrState(res?: RequestRes) {
-  if(!res) {
-    pageData.state = 13
+function quietStop() {
+  wsManualClose = true
+  clearEnterRetry()
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer)
+    wsReconnectTimer = 0
+  }
+  wsCheckToken++
+  if (intervalHb) {
+    clearInterval(intervalHb)
+    intervalHb = 0
+  }
+  if (ws) {
+    try {
+      ws.onclose = null
+      ws.close()
+    } catch { /* already closed */ }
+    ws = null
+  }
+  destroyPlayerInstance()
+}
+
+function applySnapshot(data: RoRes, fromPaste: boolean) {
+  if (data.guestId) guestId = data.guestId
+  const status = statusFrom(data)
+  if (fromPaste) {
+    playAfterLoad = true
+    applyIncomingContent(data.content, {
+      ...status,
+      playStatus: "PLAYING",
+      contentStamp: 0,
+      speedRate: "1",
+      operateStamp: time.getTime(),
+    }, true)
     return
   }
-  let { code } = res
-  if(code === "0000") {
+  applyIncomingContent(data.content, status, false)
+}
+
+function applyIncomingContent(content: ContentData | null | undefined, status: RoomStatus | undefined, fromPaste: boolean) {
+  const previous = latestStatus
+  if (status) latestStatus = status
+  if ((fromPaste || playAfterLoad) && latestStatus) {
+    latestStatus = {
+      ...latestStatus,
+      playStatus: "PLAYING",
+      contentStamp: 0,
+      speedRate: "1",
+    }
+  }
+  if (!content?.audioUrl) {
+    // A restart, or a FIRST_SEND that raced ahead of SET_CONTENT.
+    if (playAfterLoad || pageData.parsing || (pageData.content?.audioUrl && status && previous && status.operateStamp < previous.operateStamp)) {
+      if (previous) latestStatus = previous
+      return
+    }
+    clearEpisode()
     return
   }
-  else if(code === "E4004") {
-    pageData.state = 12
+  const changed = pageData.content?.audioUrl !== content.audioUrl
+  pageData.content = content
+  if (pageData.state !== 15) pageData.state = 3
+  const afterReady = () => {
+    void finishApply(fromPaste)
   }
-  else if(code === "E4006") {
-    pageData.state = 11
+  if (changed || !player) rebuildPlayer(afterReady)
+  else afterReady()
+}
+
+async function finishApply(fromPaste: boolean) {
+  if (!fromPaste && !playAfterLoad) {
+    const now = time.getLocalTime()
+    if (now - lastOperateLocalStamp < 900) return
+    if (now - lastNewStatusFromWsStamp < 900) return
   }
-  else if(code === "E4003") {
-    pageData.state = 14
+  await receiveNewStatus(fromPaste ? "http" : "http")
+  if (!(fromPaste || playAfterLoad)) return
+  publishStart()
+  if (isAppleMobile() && !audioUnlocked) {
+    pageData.showSyncGate = true
+    return
   }
-  else if(code === "R0001") {
-    pageData.state = 15
-  }
-  else {
-    pageData.state = 20
+  playAfterLoad = false
+  if (playStatus !== "PLAYING" && player) {
+    isRemoteSetPlaying = true
+    isRemoteSetSeek = true
+    seekPrecise(player, 0)
+    try {
+      const ret = player.play()
+      if (ret && typeof ret.catch === "function") {
+        ret.catch(() => { pageData.showSyncGate = true })
+      }
+    } catch {
+      pageData.showSyncGate = true
+    }
   }
 }
 
-// 成功进入房间后: 
-//    赋值 / 创建播放器 / 开启 20s 轮询机制 / 建立 webSocket
-function afterEnter(roRes: RoRes) {
-  guestId = roRes?.guestId ?? ""
-  pageData.content = roRes.content
-  pageData.amIOwner = roRes?.iamOwner === "Y" ? true : false
-  pageData.participants = showParticipants(roRes.participants, guestId)
-  pageData.showMoreBox = handleShowMoreBox(roRes.content)
-
-  createPlayer()
-  heartbeat()
-  connectWebSocket()
-  shareData(roRes.content, roRes.playStatus, nickName)
+function clearEpisode() {
+  pageData.content = null
+  playAfterLoad = false
+  destroyPlayerInstance()
 }
 
-// 创建播放器
+function rebuildPlayer(done?: () => void) {
+  destroyPlayerInstance()
+  nextTick(() => {
+    if (pageData.state === 15) return
+    if (!pageData.content?.audioUrl || !playerEl.value) return
+    createPlayer()
+    done && done()
+  })
+}
+
+function destroyPlayerInstance() {
+  clearMediaSession()
+  if (player) {
+    try { player.destroy() } catch (err) { console.log(err) }
+    player = null
+  }
+  srcDuration = 0
+  playerReadySettled = false
+  if (playerEl.value) playerEl.value.replaceChildren()
+}
+
+export async function submitEpisode(link: string) {
+  if (pageData.state === 15 || pageData.parsing) return
+  ensureLocalId()
+  pageData.parsing = true
+  playAfterLoad = true
+  try {
+    let res = await request_set_content(link)
+    if (res?.code === "E4003" || res?.errMsg === "NOT_IN_SESSION") {
+      const entered = await request_enter()
+      if (isSessionFull(entered)) {
+        markFull(entered)
+        return
+      }
+      if (entered?.code === "0000") {
+        handleEnterResult(entered, true)
+        res = await request_set_content(link)
+      }
+    }
+    if (isSessionFull(res)) {
+      markFull(res)
+      return
+    }
+    if (!res || res.code !== "0000" || !res.data?.content?.audioUrl) {
+      playAfterLoad = false
+      await cui.showModal({
+        title: "请粘贴小宇宙单集链接",
+        content: res?.showMsg || "没有解析到这集的音频",
+        showCancel: false,
+      })
+      return
+    }
+    applySnapshot(res.data, true)
+  } finally {
+    pageData.parsing = false
+  }
+}
+
+function publishStart() {
+  if (!localId || !pageData.content?.audioUrl) return
+  pendingPlay = true
+  playStatus = "PLAYING"
+  flushPendingPlay()
+}
+
+function flushPendingPlay() {
+  if (!pendingPlay || !wsJoined || !isWsOpen(ws) || !localId) return
+  pendingPlay = false
+  sendToWebSocket(ws, {
+    operateType: "SET_PLAYER",
+    "x-pt-local-id": localId,
+    "x-pt-stamp": time.getTime(),
+    playStatus: "PLAYING",
+    speedRate: "1",
+    contentStamp: 0,
+  })
+}
+
 function createPlayer() {
-  let content = pageData.content as ContentData
+  const content = pageData.content
+  if (!content?.audioUrl) return
 
-  waitPlayer = new Promise((a: SimpleFunc) => {
-    playerAlready = a
+  if (!playerReadySettled) playerAlready(true)
+  playerGen += 1
+  const gen = playerGen
+  playerReadySettled = false
+  waitPlayer = new Promise((resolve) => {
+    playerAlready = resolve
   })
 
-  const audio = {
-    src: content.audioUrl,
-    title: content.title,
-    cover: content.imageUrl || images.APP_LOGO,
-    artist: content.seriesName,
-  }
-
   const durationchange = (duration?: number) => {
-    if(duration) srcDuration = duration
+    if (gen !== playerGen) return
+    if (duration) srcDuration = duration
     showPage()
   }
-  const canplay = (e: Event) => {}
-  const loadeddata = (e: Event) => {}
-
-  const pause = (e: Event) => {
+  const pause = () => {
     playStatus = "PAUSED"
-    if(isRemoteSetPaused) {
+    if (isRemoteSetPaused) {
       isRemoteSetPaused = false
       return
     }
-    // iOS 切到后台时可能误发 pause，此时不要用过期状态去改房间
     if (document.visibilityState === "hidden") return
     collectLatestStatus()
   }
-  const playing = (e: Event) => {
-    pausedSec = 0
+  const playing = () => {
     playStatus = "PLAYING"
-    if(isRemoteSetPlaying) {
+    if (isRemoteSetPlaying) {
       isRemoteSetPlaying = false
       return
     }
     collectLatestStatus()
   }
-  const ratechange = (e: Event) => {
-    if(isRemoteSetSpeedRate) {
+  const ratechange = () => {
+    if (isRemoteSetSpeedRate) {
       isRemoteSetSpeedRate = false
       return
     }
     collectLatestStatus()
   }
-  const seeked = (e: Event) => {
-    if(isRemoteSetSeek) {
+  const seeked = () => {
+    if (isRemoteSetSeek) {
       isRemoteSetSeek = false
       return
     }
     collectLatestStatus()
   }
-  const callbacks = {
-    durationchange,
-    canplay,
-    loadeddata,
-    pause,
-    playing,
-    ratechange,
-    seeked
-  }
 
-  const onBeforeClick = (target: string): boolean => {
-    if(pageData.amIOwner || !target) return true
-    const list = ["play_or_pause", "forward", "backward", "speed", "seek"]
-    const isRestricted = list.includes(target)
-    if(pageData.everyoneCanOperatePlayer === "N" && isRestricted) {
-      showOperateFailed()
-      return false
-    }
-    return true
-  }
-
-  player = initPlayer(playerEl, audio, callbacks, onBeforeClick)
+  player = initPlayer(
+    playerEl,
+    {
+      src: content.audioUrl,
+      title: content.title,
+      cover: content.imageUrl || images.APP_LOGO,
+      artist: content.seriesName,
+    },
+    { durationchange, pause, playing, ratechange, seeked },
+    () => true,
+  )
   enhanceAudioElement(player, playerEl.value)
   bindMediaSession({
     getPlayer: () => player,
@@ -360,20 +480,10 @@ function createPlayer() {
     getPlayStatus: () => playStatus,
     canOperatePlayer,
   }, content)
-  maybeOfferSyncGate()
-  checkPlayerReady()
-}
-
-let lastShowOperateFailed = 0
-function showOperateFailed() {
-  const now = time.getLocalTime()
-  if(lastShowOperateFailed + 500 > now) return
-  lastShowOperateFailed = now
-  cui.showModal({
-    title: "提示",
-    content: "房主已设置仅房主能操作播放器。不过，你仍然可以调整是否静音（在\"...\"里）。",
-    showCancel: false,
-  })
+  if (isAppleMobile() && !audioUnlocked && (playAfterLoad || latestStatus?.playStatus === "PLAYING")) {
+    pageData.showSyncGate = true
+  }
+  void checkPlayerReady()
 }
 
 function isAppleMobile(): boolean {
@@ -381,43 +491,26 @@ function isAppleMobile(): boolean {
   return !!(cha.isIOS || cha.isIPadOS)
 }
 
-function maybeOfferSyncGate() {
-  if (audioUnlocked) return
-  if (isAppleMobile()) {
-    pageData.showSyncGate = true
-  }
-}
-
-// 开始检测 player 是否已经 ready
 async function checkPlayerReady() {
-  if(!isAppleMobile()) {
-    checkPlayerReadyAgain(6000)
+  if (!isAppleMobile()) {
+    void checkPlayerReadyAgain(6000)
     return
   }
-  // iOS 在没有用户手势前经常拿不到 duration，先把房间界面和「点击开始」遮罩亮出来
   await util.waitMilli(800)
-  if (pageData.state <= 2) {
-    showPage()
-  }
-  maybeOfferSyncGate()
-  checkPlayerReadyAgain(12000)
+  showPage()
+  void checkPlayerReadyAgain(12000)
 }
 
-// 初始化播放器后再次检查播放器，是否加载到播放时长
-async function checkPlayerReadyAgain(waitMs: number = 6000) {
+async function checkPlayerReadyAgain(waitMs = 6000) {
   await util.waitMilli(waitMs)
-  if(pageData.state >= 3 && srcDuration) return
-  // 还在等用户点遮罩解锁时，不要误报「未知的异常」
-  if (pageData.showSyncGate && !audioUnlocked) return
-  if(pageData.state >= 3) return
-  console.log("######## 等了若干秒无果，切换到未知的异常 ########")
-  console.log(" ")
-  pageData.state = 19
+  showPage()
 }
 
 function showPage(): void {
-  if(pageData.state <= 2) {
-    pageData.state = 3
+  if (pageData.state === 15) return
+  if (pageData.state < 3) pageData.state = 3
+  if (!playerReadySettled) {
+    playerReadySettled = true
     playerAlready(true)
   }
 }
@@ -426,210 +519,103 @@ async function onTapSyncGate() {
   if (!player) return
   audioUnlocked = true
   pageData.showSyncGate = false
+  const wantPlay = playAfterLoad || latestStatus?.playStatus === "PLAYING"
   await unlockAudioElement(player)
-  if (srcDuration) {
-    await receiveNewStatus("check")
-  } else {
-    // 解锁后再给解码一点时间
-    await util.waitMilli(400)
-    if (srcDuration) await receiveNewStatus("check")
+  if (srcDuration && latestStatus) await receiveNewStatus("check")
+  if (wantPlay && playStatus !== "PLAYING") {
+    isRemoteSetPlaying = true
+    try { await player.play() } catch { /* the button can be tapped again */ }
+  }
+  if (playAfterLoad) {
+    playAfterLoad = false
+    publishStart()
   }
   updatePositionState()
 }
 
-// 收集最新状态，再用 ws 上报
 function collectLatestStatus() {
   lastOperateLocalStamp = time.getLocalTime()
-  if(timeoutCollect) clearTimeout(timeoutCollect)
-
-  const _collect = () => {
-    if(!player) return
-    if(!canOperatePlayer()) return
+  if (timeoutCollect) clearTimeout(timeoutCollect)
+  timeoutCollect = window.setTimeout(() => {
+    if (!player || !localId || !pageData.content?.audioUrl) return
     if (document.visibilityState === "hidden") return
-
-    const currentTime = currentAudioTime()
-    let contentStamp = currentTime * 1000
-    contentStamp = util.numToFix(contentStamp, 0)
-    let param: Record<string, any> = {
+    const contentStamp = util.numToFix(currentAudioTime() * 1000, 0)
+    sendToWebSocket(ws, {
       operateType: "SET_PLAYER",
-      roomId: pageData.roomId,
       "x-pt-local-id": localId,
       "x-pt-stamp": time.getTime(),
       playStatus,
-      speedRate: String(player.playbackRate),
+      speedRate: normalizeRate(player.playbackRate),
       contentStamp,
-    }
-    if(pageData.amIOwner) {
-      param.everyoneCanOperatePlayer = pageData.everyoneCanOperatePlayer
-    }
-    sendToWebSocket(ws, param)
-    checkOperated()
-  }
-
-  timeoutCollect = setTimeout(() => {
-    _collect()
+    })
+    void checkOperated()
   }, COLLECT_TIMEOUT)
 }
 
-// 检查操作播放器 远端是否有收到
 async function checkOperated() {
   await util.waitMilli(2500)
-  const now = time.getLocalTime()
-  const diff = now - lastNewStatusFromWsStamp
-  console.log("检查操作播放器远端是否接收 时间差 (理想状态小于 2500):")
-  console.log(diff)
-  console.log(" ")
-  if(diff < 3000) return
-
-  // 去重新连接 web-socket
+  if (time.getLocalTime() - lastNewStatusFromWsStamp < 3000) return
   connectWebSocket()
 }
 
-// 每若干秒的心跳
 function heartbeat() {
-  const _env = util.getEnv()
-  heartbeatNum = 0
+  const period = util.getEnv().HEARTBEAT_PERIOD || 15
   lastHeartbeatStamp = 0
-
-  const _closeRoom = (val: PageState, sendLeave: boolean = false) => {
-    pageData.state = val
-    leaveRoom(sendLeave)
-  }
-
-  const _newRoomStatus = (roRes: RoRes) => {
-    pageData.content = roRes.content
-    pageData.participants = showParticipants(roRes.participants, guestId)
-
+  if (intervalHb) clearInterval(intervalHb)
+  intervalHb = window.setInterval(async () => {
     const now = time.getLocalTime()
-    const diff1 = now - lastOperateLocalStamp
-    const diff2 = now - lastNewStatusFromWsStamp
-    if(diff1 < 900) {
-      console.log("刚刚 900ms 内本地有操作播放器")
-      console.log("故不采纳心跳的 info")
-      console.log(" ")
-      return
-    }
-    if(diff2 < 900) {
-      console.log("刚刚 900ms 内 web-socket 发来了最新状态")
-      console.log("故不采纳心跳的 info")
-      console.log(" ")
-      return
-    }
-
-    latestStatus = {
-      roomId: roRes.roomId,
-      playStatus: roRes.playStatus,
-      speedRate: roRes.speedRate,
-      operator: roRes.operator,
-      contentStamp: roRes.contentStamp,
-      operateStamp: roRes.operateStamp
-    }
-    if(roRes.everyoneCanOperatePlayer) {
-      pageData.everyoneCanOperatePlayer = roRes.everyoneCanOperatePlayer
-    }
-    receiveNewStatus("http")
-  }
-
-  const _webSocketHb = () => {
-    const send = {
-      operateType: "HEARTBEAT",
-      roomId: pageData.roomId,
-      "x-pt-local-id": localId,
-      "x-pt-stamp": time.getTime()
-    }
-    sendToWebSocket(ws, send)
-  }
-
-  intervalHb = setInterval(async () => {
-
-    // 心跳数有没有超过最大值
-    heartbeatNum++
-    if(heartbeatNum > MAX_HB_NUM) {
-      _closeRoom(16, true)
-      return
-    }
-
-    // 检查上一次心跳的时间，如果超过 35s
-    // 就代表被浏览器限制定时了，执行 resume
-    const now = time.getLocalTime()
-    if(lastHeartbeatStamp > 0 && lastHeartbeatStamp + 35000 < now) {
-      silentRecover()
+    if (lastHeartbeatStamp > 0 && lastHeartbeatStamp + 35000 < now) {
+      void silentRecover()
       return
     }
     lastHeartbeatStamp = now
-
-    // 检查是否已暂停 5 分钟
-    if(playStatus === "PAUSED") {
-      pausedSec += _env.HEARTBEAT_PERIOD
-      if(pausedSec >= (5 * 60)) {
-        _closeRoom(17, true)
-        return
-      }
-    }
-    else pausedSec = 0
-
-    const res = await request_heartbeat(pageData.roomId, nickName)
-    if(!res) return
-    const { code, data } = res
-    if(code === "0000") {
-      _newRoomStatus(data as RoRes)
-      _webSocketHb()
-    }
-    else if(code === "E4004") _closeRoom(12, false)
-    else if(code === "E4006") _closeRoom(11, false)
-    else if(code === "E4003") _closeRoom(14, false)
-
-  }, _env.HEARTBEAT_PERIOD * 1000)
-}
-
-// 用户息屏后、再打开，可能在这之间的定时器被浏览器限制了，或 WebSocket 已断开。
-// 静默拉房间快照并对齐，不要打断正在播的音频，也不要弹出「请稍等」。
-async function silentRecover() {
-  if (recovering) return
-  if (pageData.state !== 2 && pageData.state !== 3) return
-  recovering = true
-  pausedSec = 0
-  console.log("执行 silentRecover......................")
-
-  try {
-    await time.calibrateTime()
-
-    if (!isWsOpen(ws)) {
-      connectWebSocket()
-    }
-
-    let res = await request_heartbeat(pageData.roomId, nickName)
-    if (res && (res.code === "E4003" || res.code === "E4004" || res.code === "E4006")) {
-      // 心跳认为不在房间里时再走一次进入，仍不销毁播放器
-      res = await request_enter(pageData.roomId, nickName)
-    }
+    const res = await request_heartbeat()
     if (!res) return
-    if (res.code !== "0000") {
-      enterResToErrState(res)
-      if (pageData.state >= 11) leaveRoom(false)
+    if (isSessionFull(res)) {
+      markFull(res)
       return
     }
-    const roRes = res.data as RoRes
-    if (roRes.guestId) guestId = roRes.guestId
-    pageData.content = roRes.content
-    pageData.participants = showParticipants(roRes.participants, guestId)
-    if (roRes.iamOwner) pageData.amIOwner = roRes.iamOwner === "Y"
-    if (roRes.everyoneCanOperatePlayer) {
-      pageData.everyoneCanOperatePlayer = roRes.everyoneCanOperatePlayer
+    if (res.code === "0000" && res.data) {
+      applySnapshot(res.data, false)
+      sendToWebSocket(ws, {
+        operateType: "HEARTBEAT",
+        "x-pt-local-id": localId,
+        "x-pt-stamp": time.getTime(),
+      })
+      return
     }
-
-    latestStatus = {
-      roomId: roRes.roomId,
-      playStatus: roRes.playStatus,
-      speedRate: roRes.speedRate,
-      operator: roRes.operator,
-      contentStamp: roRes.contentStamp,
-      operateStamp: roRes.operateStamp,
+    if (res.code === "E4003" || res.errMsg === "NOT_IN_SESSION") {
+      void enterRoom({ soft: true })
+      return
     }
-    await receiveNewStatus("http")
+    void silentRecover()
+  }, period * 1000)
+}
 
-    // 心跳定时器如果已被清掉，重新拉起
+async function silentRecover() {
+  if (recovering || inWeChat() || pageData.state === 15) return
+  recovering = true
+  try {
+    await time.calibrateTime()
+    wsManualClose = false
+    ensureLocalId()
+    let res = guestId ? await request_heartbeat() : undefined
+    if (!guestId || !res || res.code === "E4003" || res.errMsg === "NOT_IN_SESSION") {
+      res = await request_enter()
+    }
+    if (isSessionFull(res)) {
+      markFull(res)
+      return
+    }
+    if (!res || res.code !== "0000" || !res.data) {
+      scheduleEnterRetry()
+      return
+    }
+    if (res.data.guestId) guestId = res.data.guestId
+    pageData.state = 3
+    applySnapshot(res.data, false)
     if (!intervalHb) heartbeat()
+    if (!isWsOpen(ws)) connectWebSocket()
     lastHeartbeatStamp = time.getLocalTime()
   } finally {
     recovering = false
@@ -637,167 +623,137 @@ async function silentRecover() {
 }
 
 function scheduleWsReconnect() {
-  if (wsManualClose) return
-  if (pageData.state !== 2 && pageData.state !== 3) return
+  if (wsManualClose || pageData.state === 15) return
   const now = time.getLocalTime()
   if (lastReConnectWs + 800 > now) return
   lastReConnectWs = now
   if (wsReconnectTimer) clearTimeout(wsReconnectTimer)
   const delay = Math.min(1000 * (2 ** Math.min(wsRetryCount, 3)), 8000)
   wsRetryCount++
-  console.log("将在", delay, "ms 后重连 websocket, 第", wsRetryCount, "次")
   wsReconnectTimer = window.setTimeout(() => {
     connectWebSocket()
   }, delay)
 }
 
-// 使用 web-socket 去建立连接
 function connectWebSocket() {
-  if (wsManualClose) return
-  receiveWsNum = 0
+  if (wsManualClose || !localId) return
+  wsJoined = false
   const myToken = ++wsCheckToken
-
-  // 先丢掉旧连接，避免重复
   if (ws) {
     try {
       ws.onclose = null
       ws.onmessage = null
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.close()
-      }
-    } catch (err) {}
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close()
+    } catch { /* ignore */ }
     ws = null
   }
 
-  const onmessage = (msgRes: WsMsgRes) => {
-    receiveWsNum++
-    const { responseType: rT, roomStatus } = msgRes
-
-    // 刚连接
-    if(rT === "CONNECTED") {
+  const onmessage = (msg: WsMsgRes) => {
+    if (msg.responseType === "CONNECTED") {
       firstSend()
+      return
     }
-    else if(rT === "NEW_STATUS" && roomStatus) {
-      lastNewStatusFromWsStamp = time.getLocalTime()
-      latestStatus = roomStatus
-      if(roomStatus.everyoneCanOperatePlayer) {
-        pageData.everyoneCanOperatePlayer = roomStatus.everyoneCanOperatePlayer
+    if (msg.responseType === "ERROR") {
+      if (isSessionFull(msg)) {
+        markFull(msg)
+        return
       }
-      receiveNewStatus()
+      if (msg.errMsg === "NOT_IN_SESSION" || msg.code === "E4003") {
+        guestId = ""
+        void enterRoom({ soft: true })
+        return
+      }
+      scheduleWsReconnect()
+      return
     }
-    else if(rT === "HEARTBEAT") {
-      console.log("收到 ws 的HEARTBEAT.......")
-      console.log(" ")
+    if (msg.responseType === "HEARTBEAT") return
+    if (msg.responseType === "NEW_CONTENT" || (msg.responseType === "NEW_STATUS" && msg.content !== undefined)) {
+      wsJoined = true
+      if (msg.roomStatus) lastNewStatusFromWsStamp = time.getLocalTime()
+      applyIncomingContent(msg.content ?? null, msg.roomStatus, false)
+      flushPendingPlay()
+      return
+    }
+    if (msg.responseType === "NEW_STATUS" && msg.roomStatus) {
+      wsJoined = true
+      lastNewStatusFromWsStamp = time.getLocalTime()
+      latestStatus = msg.roomStatus
+      if (msg.roomStatus.playStatus === "PLAYING") playAfterLoad = false
+      void receiveNewStatus()
+      flushPendingPlay()
     }
   }
 
-  const onopen = () => {
-    wsRetryCount = 0
-  }
-
-  const onclose = (closeEvent: CloseEvent) => {
-    console.log("websocket closed, code =", closeEvent.code)
-    if (wsManualClose) return
-    scheduleWsReconnect()
-  }
-
-  const callbacks = {
+  ws = initWebSocket({
     onmessage,
-    onopen,
-    onclose
-  }
-  ws = initWebSocket(callbacks)
-  checkWebSocket(myToken)
+    onopen: () => { wsRetryCount = 0 },
+    onclose: (ev) => {
+      if (wsManualClose || pageData.state === 15) return
+      if (ev.code === 4003) {
+        guestId = ""
+        void enterRoom({ soft: true })
+        return
+      }
+      scheduleWsReconnect()
+    },
+  })
+  void checkWebSocket(myToken)
 }
 
-// 等待 5s 查看 web-socket 是否连接；失败则重连，不要直接把人踢出房间
 async function checkWebSocket(token: number) {
   await util.waitMilli(5000)
-  if (token !== wsCheckToken) return
-  if (wsManualClose) return
-  if (pageData.state !== 2 && pageData.state !== 3) return
-  if(receiveWsNum < 2) {
-    console.log("websocket 5s 内未就绪，尝试重连而不是离开房间")
-    scheduleWsReconnect()
-  }
+  if (token !== wsCheckToken || wsManualClose || pageData.state === 15) return
+  if (!isWsOpen(ws)) scheduleWsReconnect()
 }
 
-// "首次发送" 给 websocket
 function firstSend() {
-  const send = {
+  sendToWebSocket(ws, {
     operateType: "FIRST_SEND",
-    roomId: pageData.roomId,
     "x-pt-local-id": localId,
-    "x-pt-stamp": time.getTime()
-  }
-  sendToWebSocket(ws, send)
+    "x-pt-stamp": time.getTime(),
+  })
 }
 
 async function receiveNewStatus(fromType: RevokeType = "ws") {
-  if(!latestStatus || latestStatus.roomId !== pageData.roomId) return
-  if (!player) return
+  if (!latestStatus) return
+  const gen = playerGen
+  const ready = waitPlayer
+  await ready
+  if (gen !== playerGen || !player) return
+  if (!srcDuration) return
 
-  await waitPlayer
-  let { contentStamp } = latestStatus
-
-  // 还没解析出时长时不要按 0 去 seek，否则会把进度打回开头
-  if (!srcDuration) {
-    maybeOfferSyncGate()
-    return
-  }
-
-  // 正在播放时以 audio.currentTime 为准，不要用被挂起的定时器推算本地进度
-  const localCurrent = currentAudioTime()
-  let reSeekSec = playerTool.getReSeek(latestStatus, srcDuration, localCurrent, fromType)
-  if(reSeekSec >= 0) {
+  const { contentStamp } = latestStatus
+  const reSeekSec = playerTool.getReSeek(latestStatus, srcDuration, currentAudioTime(), fromType)
+  if (reSeekSec >= 0) {
     isRemoteSetSeek = true
     seekPrecise(player, reSeekSec)
-    checkSeek()
+    void checkSeek()
   }
 
-  // 判断倍速
-  let rSpeedRate = latestStatus.speedRate
-  let speedRate = String(player.playbackRate)
-
-  if(rSpeedRate !== speedRate) {
-    console.log("播放器倍速不一致，请求调整......")
+  const remoteRate = normalizeRate(latestStatus.speedRate)
+  if (remoteRate !== normalizeRate(player.playbackRate)) {
     isRemoteSetSpeedRate = true
-    let speedRateNum = Number(rSpeedRate)
-    player.playbackRate = speedRateNum
+    player.playbackRate = Number(remoteRate)
   }
 
-  // 判断播放状态
-  let rPlayStatus = latestStatus.playStatus
-  let diff2 = (srcDuration * 1000) - contentStamp
-  if(rPlayStatus !== playStatus) {
-    // 如果剩下 1s 就结束了 还要播放，进行阻挡
-    if(rPlayStatus === "PLAYING" && diff2 < 1000) return
-    if(rPlayStatus === "PLAYING" && !isShowingAutoPlayPolicy) {
+  const remotePlay = latestStatus.playStatus
+  const remain = (srcDuration * 1000) - contentStamp
+  if (remotePlay !== playStatus) {
+    if (remotePlay === "PLAYING" && remain < 1000) return
+    if (remotePlay === "PLAYING" && !isShowingAutoPlayPolicy) {
       if (!audioUnlocked && isAppleMobile()) {
-        maybeOfferSyncGate()
+        pageData.showSyncGate = true
         return
       }
-      console.log("远端请求播放......")
       isRemoteSetPlaying = true
       try {
         const ret = player.play()
-        if (ret && typeof ret.catch === "function") {
-          ret.catch((err: any) => {
-            console.log("播放失败.....")
-            console.log(err)
-            handleAutoPlayPolicy()
-          })
-        }
-      }
-      catch(err) {
-        console.log("播放失败.....")
-        console.log(err)
+        if (ret && typeof ret.catch === "function") ret.catch(() => handleAutoPlayPolicy())
+      } catch {
         handleAutoPlayPolicy()
       }
-      checkIsPlaying()
-    }
-    else if(rPlayStatus === "PAUSED") {
-      console.log("远端请求暂停......")
+      void checkIsPlaying()
+    } else if (remotePlay === "PAUSED") {
       isRemoteSetPaused = true
       player.pause()
     }
@@ -805,12 +761,11 @@ async function receiveNewStatus(fromType: RevokeType = "ws") {
   updatePositionState()
 }
 
-// 由于 iOS 初始化时设置时间点 会不起作用
-// 所以重新做检查
 async function checkSeek() {
   await util.waitMilli(600)
-  let reSeekSec = playerTool.getReSeek(latestStatus, srcDuration, currentAudioTime(), "check")
-  if(reSeekSec >= 0) {
+  if (!latestStatus || !player || !srcDuration) return
+  const reSeekSec = playerTool.getReSeek(latestStatus, srcDuration, currentAudioTime(), "check")
+  if (reSeekSec >= 0) {
     isRemoteSetSeek = true
     seekPrecise(player, reSeekSec)
   }
@@ -818,81 +773,35 @@ async function checkSeek() {
 
 async function checkIsPlaying() {
   await util.waitMilli(1500)
-  const rPlayStatus = latestStatus.playStatus
-  if(rPlayStatus === "PLAYING" && playStatus === "PAUSED") {
-    handleAutoPlayPolicy()
-  }
+  if (!latestStatus) return
+  if (latestStatus.playStatus === "PLAYING" && playStatus === "PAUSED") handleAutoPlayPolicy()
 }
 
 async function handleAutoPlayPolicy() {
-  if(isShowingAutoPlayPolicy) return
-  if (pageData.showSyncGate) return
-
-  // iOS / 自动播放被拦截：改用全屏「点击开始同步收听」，一次手势解锁后对齐房间进度
+  if (isShowingAutoPlayPolicy || pageData.showSyncGate) return
   if (!audioUnlocked) {
     pageData.showSyncGate = true
     return
   }
-
   isShowingAutoPlayPolicy = true
-  let res1 = await cui.showModal({
-    title: "当前房间正在播放",
-    content: "🔇还是🔊？",
+  const choice = await cui.showModal({
+    title: "点击后才能播放",
+    content: "要不要出声？",
     cancelText: "静音",
-    confirmText: "开声音"
+    confirmText: "开声音",
   })
   isShowingAutoPlayPolicy = false
-
-  // 如果是静音
-  if(res1.cancel) {
-    player.muted = true
+  if (!player || !latestStatus) return
+  if (choice.cancel) player.muted = true
+  if (srcDuration) {
+    const reSeekSec = playerTool.getReSeek(latestStatus, srcDuration, currentAudioTime(), "check")
+    if (reSeekSec >= 0) {
+      isRemoteSetSeek = true
+      seekPrecise(player, reSeekSec)
+    }
   }
-
-  // 调整进度条
-  let reSeekSec = playerTool.getReSeek(latestStatus, srcDuration, currentAudioTime(), "check")
-  if(reSeekSec >= 0) {
-    isRemoteSetSeek = true
-    seekPrecise(player, reSeekSec)
-  }
-
-  // 开始播放
-  if(latestStatus.playStatus === "PLAYING") {
+  if (latestStatus.playStatus === "PLAYING") {
     isRemoteSetPlaying = true
     player.play()
   }
-}
-
-
-// 离开房间
-async function leaveRoom(sendLeave: boolean = true) {
-  wsManualClose = true
-  if (wsReconnectTimer) {
-    clearTimeout(wsReconnectTimer)
-    wsReconnectTimer = 0
-  }
-  wsCheckToken++
-  pageData.showSyncGate = false
-  audioUnlocked = false
-  unbindLifecycle()
-  clearMediaSession()
-
-  // 销毁心跳
-  if(intervalHb) clearInterval(intervalHb)
-  intervalHb = 0
-
-  // 关闭 web-socket
-  if(ws) {
-    try { ws.close() } catch (err) {}
-    ws = null
-  }
-
-  // 销毁播放器（只在真正离开房间时；前后台切换不会走到这里）
-  if(player) {
-    player.destroy()
-    player = null
-  }
-
-  if(!sendLeave) return
-  // 去发送离开房间的请求
-  await request_leave(pageData.roomId, nickName)
 }

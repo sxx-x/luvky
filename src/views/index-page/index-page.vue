@@ -1,172 +1,285 @@
 <script setup lang="ts">
-import PtButton from "../../components/pt-button.vue"
-import { useRouter } from "../../routes/pt-router"
-import images from "../../images"
-import { onActivated } from "vue";
-import share from "../../utils/share";
-import { useTheme } from "../../hooks/useTheme";
-import { useAddToHomeScreen } from "./tools/useAddToHomeScreen";
+import "shikwasa2/dist/shikwasa.min.css"
+import { computed, ref } from "vue"
+import { useRoomPage } from "../room-page/tools/useRoomPage"
+import { extractXiaoyuzhouEpisodeLink } from "./tools/episode-link"
+import { useAddToHomeScreen } from "./tools/useAddToHomeScreen"
+import ptApi from "../../utils/pt-api"
+import cui from "../../components/custom-ui"
 
-const OPEN_SOURCE_URL = "https://github.com/yenche123/podcast-together"
+const isWeChat = ptApi.getCharacteristic().isWeChat
+const { pageData, playerEl, submitEpisode, onTapSyncGate } = useRoomPage()
 const { showInstallPwaBtn, onTapInstall, showIosA2hsHint } = useAddToHomeScreen()
-let { theme } = useTheme()
-const router = useRouter()
 
-onActivated(() => {
-  share.configShare()
-})
+const draft = ref("")
+let lastSubmit = ""
+let lastSubmitAt = 0
 
-const onTapCreateBtn = (e: Event) => {
-  router.push({ name: "create" })
+const hasAudio = computed(() => Boolean(pageData.content?.audioUrl))
+const showSyncGate = computed(() => pageData.showSyncGate && hasAudio.value)
+
+function submitOrWarn(text: string) {
+  const link = extractXiaoyuzhouEpisodeLink(text)
+  if (!link) {
+    if (text.trim()) {
+      cui.showModal({
+        title: "请粘贴小宇宙单集链接",
+        content: "只能粘贴小宇宙单集链接",
+        showCancel: false,
+      })
+    }
+    return
+  }
+  const now = Date.now()
+  if (link === lastSubmit && now - lastSubmitAt < 1200) return
+  lastSubmit = link
+  lastSubmitAt = now
+  draft.value = ""
+  void submitEpisode(link)
 }
 
+function onPaste(ev: ClipboardEvent) {
+  const text = ev.clipboardData?.getData("text") ?? ""
+  if (text.trim()) {
+    ev.preventDefault()
+    draft.value = ""
+    submitOrWarn(text)
+    return
+  }
+  window.setTimeout(() => {
+    if (!draft.value.trim()) return
+    const value = draft.value
+    draft.value = ""
+    submitOrWarn(value)
+  }, 0)
+}
+
+function onEnter() {
+  if (!draft.value.trim()) return
+  const value = draft.value
+  draft.value = ""
+  submitOrWarn(value)
+}
 </script>
 
 <template>
+  <div v-if="isWeChat" class="gate-screen">
+    <p class="gate-title">请用 Safari 打开</p>
+  </div>
 
-  <div class="page">
+  <div v-else-if="pageData.state === 15" class="gate-screen">
+    <p class="gate-title">{{ pageData.notice || "已经有两个人在一起听了" }}</p>
+  </div>
+
+  <div v-else class="page listen-page">
     <div class="page-container">
-      <div class="div-bg-img index-icon-img"></div>
-      <h1>一起听播客</h1>
+      <h1>请粘贴小宇宙单集链接</h1>
+      <input
+        id="episode-link"
+        v-model="draft"
+        type="url"
+        inputmode="url"
+        enterkeyhint="go"
+        autocomplete="off"
+        autocapitalize="off"
+        autocorrect="off"
+        spellcheck="false"
+        maxlength="1000"
+        placeholder="https://www.xiaoyuzhoufm.com/episode/…"
+        @paste="onPaste"
+        @keydown.enter.prevent="onEnter"
+      />
+      <p v-if="pageData.parsing" class="parsing">正在解析…</p>
 
-      <a v-if="showInstallPwaBtn" class="index-opensource-url" :href="OPEN_SOURCE_URL" target="_blank">
-        <img :src="theme === 'light' ? images.GITHUB : images.GITHUB_DM" class="index-ou-github"/>
-      </a>
+      <div ref="playerEl" class="player" v-show="hasAudio"></div>
     </div>
-  </div>
 
-  <div class="page-btns-container">
-    <div class="page-btns">
-      <pt-button class="index-main-btn" text="创建房间" @click="onTapCreateBtn"></pt-button>
+    <div class="listen-footer">
+      <button v-if="showInstallPwaBtn" type="button" class="install-btn" @click="onTapInstall">
+        安装应用
+      </button>
+      <p v-if="showIosA2hsHint" class="a2hs">在 Safari 点「分享」，再选「添加到主屏幕」。</p>
+    </div>
 
-      <a v-if="!showInstallPwaBtn" :href="OPEN_SOURCE_URL" target="_blank">
-        <div class="index-other-btn">
-          <img :src="theme === 'light' ? images.GITHUB : images.GITHUB_DM" class="index-github"/>
-          <span>开源地址</span>
-        </div>
-      </a>
-      <div v-else class="index-other-btn" @click="onTapInstall">
-        <img :src="theme === 'light' ? images.IC_DOWNLOAD : images.IC_DOWNLOAD_DM" class="index-btn-icon"/>
-        <span>安装应用</span>
+    <div v-if="showSyncGate" class="sync-gate" @click="onTapSyncGate">
+      <div class="sync-gate-card" @click.stop="onTapSyncGate">
+        <h2>点击开始同步收听</h2>
+        <p>点一下即可对齐进度</p>
+        <button type="button" class="sync-gate-btn" @click.stop="onTapSyncGate">开始同步收听</button>
       </div>
-      
-      <p v-if="showIosA2hsHint" class="ios-a2hs-hint">
-        在 Safari 底部点「分享」，再选「添加到主屏幕」，即可像 App 一样打开，锁屏后也更容易继续听。
-      </p>
-      <p class="page-btns-p">
-        本项目由开源 Serverless 平台 <a class="pbp-a" href="https://www.lafyun.com/" target="_blank">Laf</a> 全力驱动支持
-      </p>
     </div>
   </div>
-
 </template>
 
-<style scoped lang="scss" >
-.page {
-  min-height: calc(100vh - 190px);
+<style scoped lang="scss">
+.listen-page {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
 
-  .page-container {
+.page-container {
+  padding-top: calc(28px + env(safe-area-inset-top));
+  align-items: stretch;
+  text-align: left;
 
-    .index-icon {
-      font-size: 50px;
-      margin-bottom: 50px;
-    }
+  h1 {
+    margin: 0 0 20px;
+    font-size: 22px;
+    line-height: 1.4;
+    font-weight: 700;
+    letter-spacing: 0;
+    color: var(--text-color);
+    text-align: center;
+  }
 
-    .index-icon-img {
-      width: 60px;
-      height: 60px;
-      background-image: v-bind("'url(' + images.APP_LOGO + ')'");
-      margin-bottom: 50px;
-    }
+  input {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 56px;
+    padding: 14px 16px;
+    border: 0;
+    border-radius: 16px;
+    background: var(--card-color);
+    color: var(--text-color);
+    font-size: 17px;
+    line-height: 1.4;
+    text-align: center;
+  }
 
-    h1 {
-      font-size: 38px;
-      line-height: 50px;
-      color: var(--text-color);
-      letter-spacing: 2px;
-    }
+  input::-webkit-input-placeholder {
+    color: var(--note-color);
+  }
 
-    .index-opensource-url {
-      position: absolute;
-      top: 14px;
-      right: 4px;
-      width: 40px;
-      height: 40px;
-      transition: opacity .15s;
+  .parsing {
+    margin: 14px 0 0;
+    text-align: center;
+    color: var(--desc-color);
+    font-size: 15px;
+  }
 
-      .index-ou-github {
-        width: 100%;
-        height: 100%;
-        opacity: .78;
-      }
-
-      &:hover {
-        opacity: .66;
-      }
-    }
+  .player {
+    width: 100%;
+    margin-top: 28px;
+    position: relative;
+    z-index: 1;
   }
 }
 
-.page-btns-container {
-  min-height: 170px;
-  padding-bottom: 20px;
+.listen-footer {
+  width: 92%;
+  max-width: var(--standard-max-px);
+  margin: 8px auto 0;
+  padding-bottom: calc(24px + env(safe-area-inset-bottom));
+}
 
-  .page-btns {
+.install-btn {
+  appearance: none;
+  width: 100%;
+  min-height: 52px;
+  border: 0;
+  border-radius: 26px;
+  background: var(--other-btn-bg);
+  color: var(--other-btn-text);
+  font-size: 17px;
+  cursor: pointer;
+}
 
-    .index-main-btn {
-      margin-bottom: 20px;
-    }
+.a2hs {
+  margin: 14px 0 0;
+  text-align: center;
+  color: var(--note-color);
+  font-size: 14px;
+  line-height: 1.5;
+}
 
-    .index-other-btn {
-      height: 50px;
-      width: 100%;
-      border-radius: 50px;
-      font-size: var(--btn-font);
-      background-color: var(--other-btn-bg);
-      color: var(--other-btn-text);
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      cursor: pointer;
-      margin-bottom: 20px;
+.gate-screen {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  padding-top: calc(24px + env(safe-area-inset-top));
+  padding-bottom: calc(24px + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+  text-align: center;
+}
 
-      .index-github {
-        width: 20px;
-        height: 20px;
-        margin-right: 10px;
-      }
+.gate-title {
+  margin: 0;
+  font-size: 28px;
+  line-height: 1.35;
+  font-weight: 700;
+  color: var(--text-color);
+}
 
-      .index-btn-icon {
-        width: 22px;
-        height: 22px;
-        margin-right: 10px;
-        opacity: .72;
-      }
-    }
+.gate-desc {
+  margin: 16px 0 0;
+  font-size: 17px;
+  line-height: 1.5;
+  color: var(--desc-color);
+}
 
-    .index-other-btn:hover {
-      background-color: var(--other-btn-hover);
-    }
+.sync-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: color-mix(in srgb, var(--bg-color) 86%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  padding-top: calc(24px + env(safe-area-inset-top));
+  padding-bottom: calc(24px + env(safe-area-inset-bottom));
+}
 
-    .ios-a2hs-hint {
-      font-size: 15px;
-      line-height: 1.6;
-      color: var(--desc-color);
-      text-align: center;
-      margin: 0 0 16px;
-      padding: 0 8px;
-    }
+.sync-gate-card {
+  width: 100%;
+  max-width: 360px;
+  background: var(--card-color);
+  border-radius: 24px;
+  padding: 32px 24px 28px;
+  text-align: center;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.12);
+}
 
-    .page-btns-p {
-      font-size: 14px;
-      color: var(--note-color);
-      text-align: center;
-      margin-block-end: 0;
+.sync-gate-card h2 {
+  margin: 0 0 12px;
+  font-size: 26px;
+  line-height: 1.3;
+  color: var(--text-color);
+}
 
-      .pbp-a {
-        color: var(--tap-color);
-      }
-    }
-  }
+.sync-gate-card p {
+  margin: 0 0 28px;
+  font-size: var(--desc-font);
+  line-height: 1.5;
+  color: var(--desc-color);
+}
+
+.sync-gate-btn {
+  appearance: none;
+  border: 0;
+  width: 100%;
+  min-height: 52px;
+  border-radius: 26px;
+  background: var(--main-btn-bg);
+  color: var(--main-btn-text);
+  font-size: 18px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.sync-gate-btn:active {
+  background: var(--hover-btn-bg);
+}
+</style>
+
+<style>
+.shk-cover {
+  background-position: center;
 }
 </style>
