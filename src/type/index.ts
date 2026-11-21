@@ -38,6 +38,8 @@ export interface ContentData {
   seriesUrl?: string    // 播客专栏链接
 }
 
+export type SleepMinutes = 15 | 30 | 45 | 60
+
 export interface RoRes {
   content: ContentData | null
   playStatus: "PLAYING" | "PAUSED"
@@ -45,6 +47,10 @@ export interface RoRes {
   operator: string
   contentStamp: number
   operateStamp: number
+  /** Chosen duration. Null means no timer. It does not shrink as time passes. */
+  sleepMinutes: SleepMinutes | null
+  /** Server wall-clock ms when playback pauses. Null means no timer. */
+  sleepEndStamp: number | null
   participants: Participant[]
   guestId?: string
   roomId?: string

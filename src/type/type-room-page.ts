@@ -1,5 +1,5 @@
 // 仅用于 room-page 的类型
-import { ContentData } from "./index"
+import { ContentData, SleepMinutes } from "./index"
 
 /**
  * 3: 可以收听
@@ -26,6 +26,10 @@ export interface PageData {
   showSyncGate: boolean
   parsing: boolean
   notice: string
+  /** Chosen duration from the session. Null means no timer. */
+  sleepMinutes: SleepMinutes | null
+  /** Shared wall-clock end, epoch ms. Null means no timer. */
+  sleepEndStamp: number | null
 }
 
 type SpeedRate = "0.8" | "1" | "1.2" | "1.5" | "1.7"
@@ -38,6 +42,10 @@ export interface RoomStatus {
   operator: string
   contentStamp: number
   operateStamp: number
+  /** Chosen duration. Null means no timer. It does not shrink. */
+  sleepMinutes: SleepMinutes | null
+  /** Server wall-clock ms when the pause fires. Null means no timer. */
+  sleepEndStamp: number | null
 }
 
 export interface WsMsgRes {

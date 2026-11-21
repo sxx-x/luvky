@@ -5,6 +5,8 @@ import { useRoomPage } from "../room-page/tools/useRoomPage"
 import { extractXiaoyuzhouEpisodeLink } from "./tools/episode-link"
 import { sampleCoverEdge } from "./tools/cover-edge"
 import { useAddToHomeScreen } from "./tools/useAddToHomeScreen"
+import { SLEEP_MINUTES, formatSleepRemaining, remainingSleepMs } from "./tools/sleep-timer"
+import time from "../../utils/time"
 import ptApi from "../../utils/pt-api"
 import cui from "../../components/custom-ui"
 
@@ -13,18 +15,28 @@ const EMPTY_EDGE = "#f3efe9"
 const PLAYING_EDGE = "#161210"
 
 const isWeChat = ptApi.getCharacteristic().isWeChat
-const { pageData, playerEl, submitEpisode, onTapSyncGate } = useRoomPage()
+const { pageData, playerEl, submitEpisode, onTapSyncGate, setSleepMinutes, cancelSleep } = useRoomPage()
 const { showInstallPwaBtn, onTapInstall, showIosA2hsHint } = useAddToHomeScreen()
 
 const draft = ref("")
 const revealEntry = ref(false)
 const linkInput = ref<HTMLInputElement | null>(null)
+const choosingSleep = ref(false)
+const sleepNow = ref(time.getTime())
 let lastSubmit = ""
 let lastSubmitAt = 0
+let sleepTick = 0
 
 const hasAudio = computed(() => Boolean(pageData.content?.audioUrl))
 const showSyncGate = computed(() => pageData.showSyncGate && hasAudio.value)
 const coverUrl = computed(() => pageData.content?.imageUrl || "")
+const showSleepRemaining = computed(() => pageData.sleepEndStamp != null)
+const sleepRemaining = computed(() => {
+  const end = pageData.sleepEndStamp
+  if (end == null) return ""
+  const left = remainingSleepMs(end, sleepNow.value)
+  return formatSleepRemaining(left ?? 0)
+})
 const washStyle = computed(() => {
   const url = coverUrl.value.replace(/[\n\r"\\]/g, "")
   if (!url) return undefined
@@ -75,6 +87,10 @@ watch(() => pageData.state, (_state, prev) => {
   refreshEdge(onPlayingSurface() && !wasPlaying)
 })
 
+watch(() => pageData.sleepEndStamp, () => {
+  sleepNow.value = time.getTime()
+})
+
 let edgeResize = 0
 function onViewportResize() {
   window.clearTimeout(edgeResize)
@@ -86,15 +102,34 @@ function onViewportResize() {
 onMounted(() => {
   window.addEventListener("resize", onViewportResize)
   window.visualViewport?.addEventListener("resize", onViewportResize)
+  syncSleepNow()
+  sleepTick = window.setInterval(syncSleepNow, 1000)
+  document.addEventListener("visibilitychange", syncSleepNow)
 })
 
 onUnmounted(() => {
   window.removeEventListener("resize", onViewportResize)
   window.visualViewport?.removeEventListener("resize", onViewportResize)
   window.clearTimeout(edgeResize)
+  window.clearInterval(sleepTick)
+  document.removeEventListener("visibilitychange", syncSleepNow)
   edgeTicket++
   paintEdge(EMPTY_EDGE)
 })
+
+function syncSleepNow() {
+  sleepNow.value = time.getTime()
+}
+
+async function onPickSleep(minutes: number) {
+  await setSleepMinutes(minutes)
+  if (pageData.sleepEndStamp != null) choosingSleep.value = false
+}
+
+async function onCancelSleep() {
+  await cancelSleep()
+  if (pageData.sleepEndStamp == null) choosingSleep.value = false
+}
 
 function submitOrWarn(text: string) {
   const link = extractXiaoyuzhouEpisodeLink(text)
@@ -236,6 +271,33 @@ async function onTapShare() {
         <button v-if="!hasAudio" type="button" class="btn btn-paste" @click="onTapPaste">粘贴链接</button>
         <button type="button" class="btn btn-share" @click="onTapShare">分享同一网址</button>
         <button v-if="hasAudio" type="button" class="btn btn-swap" @click="onTapPaste">换一集</button>
+        <div
+          v-if="hasAudio"
+          class="sleep-slot"
+          :data-sleep="showSleepRemaining ? 'running' : (choosingSleep ? 'choosing' : 'idle')"
+        >
+          <div v-if="showSleepRemaining" class="sleep-line">
+            <span class="sleep-remain" aria-live="polite">剩余 {{ sleepRemaining }}</span>
+            <button type="button" class="sleep-text" @click="choosingSleep = !choosingSleep">更改</button>
+            <button type="button" class="sleep-text" @click="onCancelSleep">取消</button>
+          </div>
+          <button
+            v-else-if="!choosingSleep"
+            type="button"
+            class="btn btn-swap"
+            @click="choosingSleep = true"
+          >睡眠定时</button>
+          <div v-if="choosingSleep" class="sleep-choices" role="group" aria-label="睡眠定时">
+            <button
+              v-for="minutes in SLEEP_MINUTES"
+              :key="minutes"
+              type="button"
+              class="sleep-text"
+              @click="onPickSleep(minutes)"
+            >{{ minutes }} 分钟</button>
+            <button v-if="!showSleepRemaining" type="button" class="sleep-text" @click="choosingSleep = false">取消</button>
+          </div>
+        </div>
         <button v-if="showInstallPwaBtn" type="button" class="install-btn" @click="onTapInstall">安装应用</button>
       </div>
     </div>
@@ -496,6 +558,48 @@ async function onTapShare() {
 }
 
 .btn-swap:active {
+  color: rgba(244, 240, 234, 0.78);
+}
+
+.sleep-slot {
+  width: 100%;
+}
+
+.sleep-line,
+.sleep-choices {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  column-gap: 18px;
+  width: 100%;
+  min-height: 36px;
+}
+
+.sleep-remain {
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  color: rgba(244, 240, 234, 0.78);
+}
+
+.sleep-text {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  margin: 0;
+  background: transparent;
+  padding: 8px 0;
+  min-height: 36px;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 500;
+  color: rgba(244, 240, 234, 0.52);
+  cursor: pointer;
+}
+
+.sleep-text:active {
   color: rgba(244, 240, 234, 0.78);
 }
 
