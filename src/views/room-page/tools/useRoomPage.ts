@@ -5,7 +5,7 @@
  */
 import { ref, reactive, onActivated, onDeactivated, nextTick } from "vue"
 import { PageData, WsMsgRes, RoomStatus, PlayStatus, RevokeType } from "../../../type/type-room-page"
-import { ContentData, RequestRes, RoRes } from "../../../type"
+import { ContentData, RequestRes, RoRes, SleepMinutes } from "../../../type"
 import ptUtil from "../../../utils/pt-util"
 import util from "../../../utils/util"
 import time from "../../../utils/time"
@@ -15,7 +15,13 @@ import images from "../../../images"
 import ptApi from "../../../utils/pt-api"
 import { initPlayer } from "./init-player"
 import { initWebSocket, sendToWebSocket, isWsOpen } from "./init-websocket"
-import { request_enter, request_heartbeat, request_set_content, isSessionFull, SESSION_FULL_TEXT } from "./room-request"
+import { request_enter, request_heartbeat, request_set_content, request_set_sleep, isSessionFull, SESSION_FULL_TEXT } from "./room-request"
+import {
+  carrySleepFields,
+  createSleepTimerClient,
+  isSleepMinutes,
+  type SleepCommand,
+} from "../../index-page/tools/sleep-timer"
 import { bindMediaSession, clearMediaSession, enhanceAudioElement, seekPrecise, unlockAudioElement, updatePositionState } from "./media-session"
 
 const COLLECT_TIMEOUT = 300
@@ -37,6 +43,8 @@ const pageData: PageData = reactive({
   showSyncGate: false,
   parsing: false,
   notice: "",
+  sleepMinutes: null,
+  sleepEndStamp: null,
 })
 
 let localId = ""
@@ -100,19 +108,70 @@ function normalizeRate(value: unknown): RoomStatus["speedRate"] {
   return hit || "1"
 }
 
+function currentSleep(): { sleepMinutes: SleepMinutes | null; sleepEndStamp: number | null } {
+  return {
+    sleepMinutes: latestStatus?.sleepMinutes ?? pageData.sleepMinutes,
+    sleepEndStamp: latestStatus?.sleepEndStamp ?? pageData.sleepEndStamp,
+  }
+}
+
 function statusFrom(ro: Partial<RoRes>, override?: Partial<RoomStatus>): RoomStatus {
+  const fromRo = carrySleepFields(ro, currentSleep())
+  const sleep = override ? carrySleepFields(override, fromRo) : fromRo
   return {
     playStatus: override?.playStatus || ro.playStatus || "PAUSED",
     speedRate: normalizeRate(override?.speedRate || ro.speedRate || "1"),
     operator: override?.operator ?? ro.operator ?? "",
     contentStamp: override?.contentStamp ?? ro.contentStamp ?? 0,
     operateStamp: override?.operateStamp ?? ro.operateStamp ?? time.getTime(),
+    sleepMinutes: sleep.sleepMinutes,
+    sleepEndStamp: sleep.sleepEndStamp,
   }
+}
+
+let sleepWriteSeq = 0
+
+function rememberSleep(source: unknown) {
+  const sleep = carrySleepFields(source, currentSleep())
+  pageData.sleepMinutes = sleep.sleepMinutes
+  pageData.sleepEndStamp = sleep.sleepEndStamp
+  if (latestStatus) {
+    latestStatus.sleepMinutes = sleep.sleepMinutes
+    latestStatus.sleepEndStamp = sleep.sleepEndStamp
+  }
+}
+
+const sleepTimer = createSleepTimerClient({
+  getEndStamp: () => pageData.sleepEndStamp,
+  publishMinutes: publishSleepMinutes,
+})
+
+async function setSleepMinutes(minutes: number) {
+  if (!isSleepMinutes(minutes)) return
+  await sleepTimer.setMinutes(minutes)
+}
+
+async function cancelSleep() {
+  await sleepTimer.cancel()
+}
+
+async function publishSleepMinutes(minutes: SleepCommand) {
+  const seq = ++sleepWriteSeq
+  let res: Awaited<ReturnType<typeof request_set_sleep>> | undefined
+  try {
+    res = await request_set_sleep(minutes)
+  } catch {
+    return
+  }
+  if (seq !== sleepWriteSeq || !res || res.code !== "0000" || !res.data) return
+  // The response carries the deadline. It does not play, pause, seek, or change rate.
+  if (!latestStatus) latestStatus = statusFrom(res.data)
+  rememberSleep(res.data)
 }
 
 export const useRoomPage = () => {
   init()
-  return { pageData, playerEl, submitEpisode, onTapSyncGate }
+  return { pageData, playerEl, submitEpisode, onTapSyncGate, setSleepMinutes, cancelSleep }
 }
 
 function init() {
@@ -271,7 +330,10 @@ function applySnapshot(data: RoRes, fromPaste: boolean) {
 
 function applyIncomingContent(content: ContentData | null | undefined, status: RoomStatus | undefined, fromPaste: boolean) {
   const previous = latestStatus
-  if (status) latestStatus = status
+  if (status) {
+    latestStatus = status
+    rememberSleep(latestStatus)
+  }
   if ((fromPaste || playAfterLoad) && latestStatus) {
     latestStatus = {
       ...latestStatus,
@@ -279,11 +341,15 @@ function applyIncomingContent(content: ContentData | null | undefined, status: R
       contentStamp: 0,
       speedRate: "1",
     }
+    rememberSleep(latestStatus)
   }
   if (!content?.audioUrl) {
     // A restart, or a FIRST_SEND that raced ahead of SET_CONTENT.
     if (playAfterLoad || pageData.parsing || (pageData.content?.audioUrl && status && previous && status.operateStamp < previous.operateStamp)) {
-      if (previous) latestStatus = previous
+      if (previous) {
+        latestStatus = previous
+        rememberSleep(previous)
+      }
       return
     }
     clearEpisode()
@@ -670,14 +736,15 @@ function connectWebSocket() {
     if (msg.responseType === "NEW_CONTENT" || (msg.responseType === "NEW_STATUS" && msg.content !== undefined)) {
       wsJoined = true
       if (msg.roomStatus) lastNewStatusFromWsStamp = time.getLocalTime()
-      applyIncomingContent(msg.content ?? null, msg.roomStatus, false)
+      applyIncomingContent(msg.content ?? null, msg.roomStatus ? statusFrom(msg.roomStatus) : undefined, false)
       flushPendingPlay()
       return
     }
     if (msg.responseType === "NEW_STATUS" && msg.roomStatus) {
       wsJoined = true
       lastNewStatusFromWsStamp = time.getLocalTime()
-      latestStatus = msg.roomStatus
+      latestStatus = statusFrom(msg.roomStatus)
+      rememberSleep(latestStatus)
       if (msg.roomStatus.playStatus === "PLAYING") playAfterLoad = false
       void receiveNewStatus()
       flushPendingPlay()
