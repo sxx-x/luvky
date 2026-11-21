@@ -6,6 +6,7 @@ import {
   MIN_OPERATE_GAP_MS,
   MAX_PARTICIPANTS,
   SPEED_RATES,
+  SLEEP_MINUTES,
 } from "./session.mjs"
 
 const EPISODE = {
@@ -42,6 +43,7 @@ test("presence window stays in the tens of seconds and is not an immediate kick"
   assert.ok(PRESENCE_TTL_MS >= 30_000 && PRESENCE_TTL_MS <= 120_000)
   assert.equal(MIN_OPERATE_GAP_MS, 250)
   assert.deepEqual(SPEED_RATES, ["0.8", "1", "1.2", "1.5", "1.7"])
+  assert.deepEqual(SLEEP_MINUTES, [15, 30, 45, 60])
 })
 
 test("two people share one session and a third is rejected with SESSION_FULL", () => {
@@ -134,8 +136,12 @@ test("both participants can play, pause, seek, and change rate; nothing here is 
     "operateStamp",
     "operator",
     "playStatus",
+    "sleepEndStamp",
+    "sleepMinutes",
     "speedRate",
   ])
+  assert.equal(play.roomStatus.sleepMinutes, null)
+  assert.equal(play.roomStatus.sleepEndStamp, null)
 
   const seek = session.setPlayer("browser-b", now() + 20, {
     playStatus: "PLAYING",
@@ -375,4 +381,349 @@ test("invalid player commands do not move an episode that is already loaded", ()
   }).ignore, "BAD_POSITION")
   assert.equal(session.roomStatus().contentStamp, 100)
   assert.equal(session.roomStatus().playStatus, "PLAYING")
+})
+
+const MINUTE = 60_000
+
+test("either participant can set, change, or cancel a sleep timer", () => {
+  const { session, now, advance } = clocked()
+  const a = session.enter("browser-a")
+  const b = session.enter("browser-b")
+  session.setContent("browser-a", EPISODE)
+  const started = now()
+  session.setPlayer("browser-a", started, {
+    playStatus: "PLAYING",
+    speedRate: "1.7",
+    contentStamp: 1000,
+  })
+
+  assert.equal(session.setSleep("browser-c", 15).errMsg, "NOT_IN_SESSION")
+  for (const bad of [10, 15.5, "30", null, undefined, true, 90, -15, 15.0 + 0.1]) {
+    assert.equal(session.setSleep("browser-a", bad).errMsg, "BAD_SLEEP", String(bad))
+  }
+  assert.equal(session.roomStatus().sleepEndStamp, null)
+  assert.equal(session.roomStatus().playStatus, "PLAYING")
+  assert.equal(session.roomStatus().contentStamp, 1000)
+
+  const set = session.setSleep("browser-a", 15)
+  assert.equal(set.code, "0000")
+  assert.equal(set.data.guestId, a.data.guestId)
+  assert.equal(set.data.sleepMinutes, 15)
+  assert.equal(set.data.sleepEndStamp, started + 15 * MINUTE)
+  assert.equal(set.data.playStatus, "PLAYING")
+  assert.equal(set.data.speedRate, "1.7")
+  assert.equal(set.data.contentStamp, 1000)
+  assert.equal(set.data.operator, a.data.guestId)
+  assert.equal(session.sleepDelay(), 15 * MINUTE)
+
+  advance(1000)
+  assert.equal(session.sleepDelay(), 15 * MINUTE - 1000)
+  const restarted = session.setSleep("browser-a", 15)
+  assert.equal(restarted.data.sleepEndStamp, now() + 15 * MINUTE)
+
+  advance(5 * MINUTE)
+  const changed = session.setSleep("browser-b", 45)
+  const end45 = now() + 45 * MINUTE
+  assert.equal(changed.data.guestId, b.data.guestId)
+  assert.equal(changed.data.sleepMinutes, 45)
+  assert.equal(changed.data.sleepEndStamp, end45)
+  assert.equal(changed.data.playStatus, "PLAYING")
+  assert.equal(session.heartbeat("browser-a").data.sleepEndStamp, end45)
+  assert.equal(session.heartbeat("browser-a").data.sleepMinutes, 45)
+
+  const cancelled = session.setSleep("browser-a", 0)
+  assert.equal(cancelled.code, "0000")
+  assert.equal(cancelled.data.sleepMinutes, null)
+  assert.equal(cancelled.data.sleepEndStamp, null)
+  assert.equal(cancelled.data.playStatus, "PLAYING")
+  assert.equal(cancelled.data.contentStamp, 1000)
+  assert.equal(session.sleepDelay(), null)
+  assert.equal(session.setSleep("browser-b", 0).data.sleepEndStamp, null)
+})
+
+test("the deadline is wall-clock and pauses both seats at the current progress", () => {
+  const { session, at, now } = clocked()
+  session.enter("browser-a")
+  session.enter("browser-b")
+  session.setContent("browser-a", EPISODE)
+  const started = now()
+  session.setPlayer("browser-b", started, {
+    playStatus: "PLAYING",
+    speedRate: "1.5",
+    contentStamp: 2000,
+  })
+  session.setSleep("browser-a", 30)
+  const deadline = started + 30 * MINUTE
+  assert.equal(session.roomStatus().sleepEndStamp, deadline)
+
+  at(deadline - 1)
+  assert.equal(session.takeDueSleep(), null)
+  assert.equal(session.roomStatus().playStatus, "PLAYING")
+  assert.equal(session.sleepDelay(), 1)
+
+  at(deadline)
+  const paused = session.takeDueSleep()
+  assert.equal(paused.playStatus, "PAUSED")
+  assert.equal(paused.contentStamp, 2000 + 30 * MINUTE * 1.5)
+  assert.equal(paused.operateStamp, deadline)
+  assert.equal(paused.operator, "")
+  assert.equal(paused.speedRate, "1.5")
+  assert.equal(paused.sleepMinutes, null)
+  assert.equal(paused.sleepEndStamp, null)
+  assert.equal(session.takeDueSleep(), null)
+  assert.equal(session.participantCount(), 2)
+  assert.equal(session.hasContent(), true)
+
+  const seen = session.heartbeat("browser-a")
+  assert.equal(seen.data.playStatus, "PAUSED")
+  assert.equal(seen.data.contentStamp, 2000 + 30 * MINUTE * 1.5)
+  assert.equal(seen.data.content.audioUrl, EPISODE.audioUrl)
+  assert.equal(seen.data.participants.length, 2)
+  assert.equal(session.heartbeat("browser-b").data.playStatus, "PAUSED")
+})
+
+test("the same wall-clock deadline lands further along at a faster rate", () => {
+  function finish(rate) {
+    const { session, at, now } = clocked()
+    session.enter("browser-a")
+    session.setContent("browser-a", EPISODE)
+    const started = now()
+    session.setPlayer("browser-a", started, {
+      playStatus: "PLAYING",
+      speedRate: rate,
+      contentStamp: 0,
+    })
+    session.setSleep("browser-a", 15)
+    at(started + 15 * MINUTE)
+    return session.takeDueSleep()
+  }
+
+  const slow = finish("0.8")
+  const fast = finish("1.7")
+  assert.equal(slow.contentStamp, 15 * MINUTE * 0.8)
+  assert.equal(fast.contentStamp, 15 * MINUTE * 1.7)
+  assert.equal(slow.operateStamp, fast.operateStamp)
+  assert.notEqual(slow.contentStamp, fast.contentStamp)
+})
+
+test("a seek or rate change keeps the deadline and the pause uses the latest anchor", () => {
+  const { session, at, now } = clocked()
+  session.enter("browser-a")
+  session.enter("browser-b")
+  session.setContent("browser-a", EPISODE)
+  const started = now()
+  session.setPlayer("browser-a", started, {
+    playStatus: "PLAYING",
+    speedRate: "1",
+    contentStamp: 0,
+  })
+  session.setSleep("browser-a", 60)
+  const deadline = started + 60 * MINUTE
+  const soughtAt = started + 10 * MINUTE
+  at(soughtAt)
+  const sought = session.setPlayer("browser-b", soughtAt, {
+    playStatus: "PLAYING",
+    speedRate: "0.8",
+    contentStamp: 50000,
+  })
+  assert.equal(sought.roomStatus.sleepEndStamp, deadline)
+  assert.equal(sought.roomStatus.sleepMinutes, 60)
+  at(deadline)
+  const paused = session.takeDueSleep()
+  assert.equal(paused.contentStamp, 50000 + 50 * MINUTE * 0.8)
+  assert.equal(paused.speedRate, "0.8")
+  assert.equal(paused.playStatus, "PAUSED")
+  assert.equal(session.hasContent(), true)
+})
+
+test("a timer that elapses while already paused clears without moving the playhead", () => {
+  const { session, at, now } = clocked()
+  const joined = session.enter("browser-a")
+  session.setContent("browser-a", EPISODE)
+  const started = now()
+  session.setPlayer("browser-a", started, {
+    playStatus: "PAUSED",
+    speedRate: "1.2",
+    contentStamp: 42000,
+  })
+  session.setSleep("browser-a", 15)
+  at(started + 15 * MINUTE)
+  const paused = session.takeDueSleep()
+  assert.equal(paused.playStatus, "PAUSED")
+  assert.equal(paused.contentStamp, 42000)
+  assert.equal(paused.operateStamp, started)
+  assert.equal(paused.operator, joined.data.guestId)
+  assert.equal(paused.speedRate, "1.2")
+  assert.equal(paused.sleepEndStamp, null)
+  assert.equal(paused.sleepMinutes, null)
+})
+
+test("changing the episode resets playback and keeps the sleep deadline", () => {
+  const { session, now } = clocked()
+  session.enter("browser-a")
+  session.enter("browser-b")
+  session.setContent("browser-a", EPISODE)
+  const started = now()
+  session.setPlayer("browser-a", started, {
+    playStatus: "PLAYING",
+    speedRate: "1.7",
+    contentStamp: 8000,
+  })
+  session.setSleep("browser-b", 30)
+  const deadline = started + 30 * MINUTE
+  const replaced = session.setContent("browser-a", {
+    ...EPISODE,
+    audioUrl: "https://media.xyzcdn.net/next.m4a",
+    title: "下一集",
+  })
+  assert.equal(replaced.data.playStatus, "PAUSED")
+  assert.equal(replaced.data.speedRate, "1")
+  assert.equal(replaced.data.contentStamp, 0)
+  assert.equal(replaced.data.operator, "")
+  assert.equal(replaced.data.content.title, "下一集")
+  assert.equal(replaced.data.sleepMinutes, 30)
+  assert.equal(replaced.data.sleepEndStamp, deadline)
+  assert.equal(session.heartbeat("browser-b").data.sleepEndStamp, deadline)
+  assert.equal(session.hasContent(), true)
+})
+
+test("while a sleep timer is armed, missed heartbeats do not drop seats or freeze playback", () => {
+  const { session, advance, now } = clocked()
+  session.enter("browser-a")
+  session.enter("browser-b")
+  session.setContent("browser-a", EPISODE)
+  const started = now()
+  session.setPlayer("browser-a", started, {
+    playStatus: "PLAYING",
+    speedRate: "1",
+    contentStamp: 0,
+  })
+  session.setSleep("browser-a", 15)
+  advance(PRESENCE_TTL_MS + 5000)
+  assert.deepEqual(session.cleanupPlaying(), [])
+  assert.equal(session.participantCount(), 2)
+  assert.equal(session.roomStatus().playStatus, "PLAYING")
+  assert.equal(session.enter("browser-c").errMsg, "SESSION_FULL")
+  const beat = session.heartbeat("browser-a")
+  assert.equal(beat.data.participants.length, 2)
+  assert.equal(beat.data.playStatus, "PLAYING")
+  assert.equal(beat.data.sleepMinutes, 15)
+})
+
+test("after the timer fires, presence expiry works again", () => {
+  const { session, at, advance, now } = clocked()
+  session.enter("browser-a")
+  session.enter("browser-b")
+  session.setContent("browser-a", EPISODE)
+  const started = now()
+  session.setPlayer("browser-a", started, {
+    playStatus: "PLAYING",
+    speedRate: "1",
+    contentStamp: 10,
+  })
+  session.setSleep("browser-a", 15)
+  const deadline = started + 15 * MINUTE
+  at(deadline)
+  const paused = session.takeDueSleep()
+  assert.equal(paused.playStatus, "PAUSED")
+  assert.equal(paused.contentStamp, 10 + 15 * MINUTE)
+  advance(PRESENCE_TTL_MS)
+  const beat = session.heartbeat("browser-a")
+  assert.equal(beat.data.participants.length, 1)
+  assert.equal(beat.data.participants[0].guestId, beat.data.guestId)
+  assert.equal(beat.data.playStatus, "PAUSED")
+  assert.equal(beat.data.content.audioUrl, EPISODE.audioUrl)
+  assert.equal(session.hasContent(), true)
+})
+
+test("cancelling the timer restores presence expiry without rewinding playback", () => {
+  const { session, advance, now } = clocked()
+  session.enter("browser-a")
+  session.enter("browser-b")
+  session.setContent("browser-a", EPISODE)
+  const started = now()
+  session.setPlayer("browser-a", started, {
+    playStatus: "PLAYING",
+    speedRate: "1",
+    contentStamp: 0,
+  })
+  session.setSleep("browser-a", 30)
+  advance(5 * MINUTE)
+  const cancelled = session.setSleep("browser-b", 0)
+  assert.equal(cancelled.data.sleepEndStamp, null)
+  assert.equal(cancelled.data.playStatus, "PLAYING")
+  assert.equal(cancelled.data.contentStamp, 0)
+  assert.equal(cancelled.data.operateStamp, started)
+  const removed = session.cleanupPlaying()
+  assert.deepEqual(removed, ["browser-a"])
+  assert.equal(session.participantCount(), 1)
+  assert.equal(session.roomStatus().playStatus, "PLAYING")
+  assert.equal(session.roomStatus().contentStamp, 0)
+})
+
+test("explicit leave during a sleep timer still frees that seat and keeps the deadline", () => {
+  const { session, at, now } = clocked()
+  session.enter("browser-a")
+  session.enter("browser-b")
+  session.setContent("browser-a", EPISODE)
+  const started = now()
+  session.setPlayer("browser-a", started, {
+    playStatus: "PLAYING",
+    speedRate: "1.2",
+    contentStamp: 1000,
+  })
+  session.heartbeat("browser-a")
+  session.heartbeat("browser-b")
+  session.setSleep("browser-a", 15)
+  const deadline = started + 15 * MINUTE
+  assert.equal(session.leave("browser-a").code, "0000")
+  const rest = session.heartbeat("browser-b")
+  assert.equal(rest.data.playStatus, "PLAYING")
+  assert.equal(rest.data.participants.length, 1)
+  assert.equal(rest.data.sleepEndStamp, deadline)
+  assert.equal(session.enter("browser-c").code, "0000")
+
+  const alone = clocked()
+  alone.session.enter("browser-a")
+  alone.session.setContent("browser-a", EPISODE)
+  const began = alone.now()
+  alone.session.setPlayer("browser-a", began, {
+    playStatus: "PLAYING",
+    speedRate: "1.2",
+    contentStamp: 1000,
+  })
+  alone.session.heartbeat("browser-a")
+  alone.session.setSleep("browser-a", 15)
+  const ends = began + 15 * MINUTE
+  alone.advance(4000)
+  alone.session.heartbeat("browser-a")
+  const leftAt = alone.now()
+  assert.equal(alone.session.leave("browser-a").code, "0000")
+  const frozen = alone.session.roomStatus()
+  assert.equal(frozen.playStatus, "PAUSED")
+  assert.equal(frozen.contentStamp, 1000 + (leftAt - began) * 1.2)
+  assert.equal(frozen.sleepEndStamp, ends)
+  assert.equal(alone.session.participantCount(), 0)
+  assert.equal(alone.session.hasContent(), true)
+  alone.at(ends)
+  const done = alone.session.takeDueSleep()
+  assert.equal(done.contentStamp, frozen.contentStamp)
+  assert.equal(done.playStatus, "PAUSED")
+  assert.equal(done.sleepEndStamp, null)
+  assert.equal(alone.session.hasContent(), true)
+})
+
+test("a sleep timer can be set before an episode, and firing does not invent one", () => {
+  const { session, at, now } = clocked()
+  session.enter("browser-a")
+  const started = now()
+  const set = session.setSleep("browser-a", 60)
+  assert.equal(set.data.sleepEndStamp, started + 60 * MINUTE)
+  assert.equal(set.data.content, null)
+  at(started + 60 * MINUTE)
+  const paused = session.takeDueSleep()
+  assert.equal(paused.playStatus, "PAUSED")
+  assert.equal(paused.sleepEndStamp, null)
+  assert.equal(session.hasContent(), false)
+  assert.equal(session.participantCount(), 1)
 })
