@@ -7,9 +7,19 @@
  *   contentStamp + (now - operateStamp) * Number(speedRate)
  * PAUSED 时位置就是 contentStamp。音量和静音不属于这份状态。
  *
+ * 定时关闭是墙上时钟，不跟倍速走。sleepMinutes 只接受 15/30/45/60，
+ * sleepEndStamp 是服务器时间轴上的截止点；两者同时为 null 表示没有定时。
+ * 到点后若正在播放，进度停在截止点那一帧，playStatus 改为 PAUSED：
+ *   contentStamp + (sleepEndStamp - operateStamp) * Number(speedRate)
+ * 不清会话、不换单集。换单集、暂停、拖动、变速也不清定时。
+ * 倒计时期间播放中的名额清扫先让路：锁屏没有心跳时，不把进度冻在上一次
+ * 心跳，也不把对方提前清出会话。显式 LEAVE 仍然马上释放名额。
+ *
  * 同一个人以 x-pt-local-id 识别。刷新或换一条 WebSocket 仍是同一个名额。
  * 断线不会立刻腾出名额；名额只在显式 LEAVE，或超过 PRESENCE_TTL_MS 没有
- * HTTP 心跳时释放。WebSocket 心跳不刷新名额。
+ * HTTP 心跳时释放。WebSocket 心跳不刷新名额。定时倒计时期间暂停这套
+ * 过期清扫；定时结束后恢复。到点时把两个人的心跳戳记到截止点，好让他们
+ * 再有一个 PRESENCE_TTL_MS 的窗口回来看到这次暂停。
  */
 
 export const MAX_PARTICIPANTS = 2
@@ -17,7 +27,9 @@ export const PRESENCE_TTL_MS = 60_000
 export const PLAYING_SWEEP_MS = 30_000
 export const MIN_OPERATE_GAP_MS = 250
 export const SPEED_RATES = Object.freeze(["0.8", "1", "1.2", "1.5", "1.7"])
+export const SLEEP_MINUTES = Object.freeze([15, 30, 45, 60])
 const SPEED_RATE_SET = new Set(SPEED_RATES)
+const SLEEP_MINUTE_SET = new Set(SLEEP_MINUTES)
 
 const GUEST_ALPHABET = "abcdefghijkmnopqrstuvwyz123456789"
 
@@ -103,6 +115,10 @@ export function createSession(nowFn = Date.now) {
   let contentStamp = 0
   let operateStamp = now()
   let operator = ""
+  /** @type {15 | 30 | 45 | 60 | null} */
+  let sleepMinutes = null
+  /** @type {number | null} */
+  let sleepEndStamp = null
   /** @type {{ clientId: string, guestId: string, enterStamp: number, heartbeatStamp: number }[]} */
   let participants = []
 
@@ -113,6 +129,8 @@ export function createSession(nowFn = Date.now) {
       operator,
       contentStamp,
       operateStamp,
+      sleepMinutes,
+      sleepEndStamp,
     }
   }
 
@@ -134,9 +152,38 @@ export function createSession(nowFn = Date.now) {
   }
 
   function prune(stamp, keepClientId) {
+    if (sleepEndStamp != null) return
     participants = participants.filter((item) => {
       return item.clientId === keepClientId || stamp - item.heartbeatStamp < PRESENCE_TTL_MS
     })
+  }
+
+  function extrapolatedStamp(atStamp) {
+    if (playStatus !== "PLAYING") return contentStamp
+    const elapsed = atStamp - operateStamp
+    if (!(elapsed > 0)) return contentStamp
+    return contentStamp + elapsed * playbackRate(speedRate)
+  }
+
+  function settleSleep(stamp) {
+    if (sleepEndStamp == null || stamp < sleepEndStamp) return false
+    const deadline = sleepEndStamp
+    if (playStatus === "PLAYING") {
+      contentStamp = extrapolatedStamp(deadline)
+      playStatus = "PAUSED"
+      operateStamp = deadline
+      operator = ""
+    }
+    for (const item of participants) {
+      if (item.heartbeatStamp < deadline) item.heartbeatStamp = deadline
+    }
+    sleepMinutes = null
+    sleepEndStamp = null
+    return true
+  }
+
+  function isSleepChoice(minutes) {
+    return minutes === 0 || (typeof minutes === "number" && Number.isInteger(minutes) && SLEEP_MINUTE_SET.has(minutes))
   }
 
   function pauseAt(stamp, nextOperator) {
@@ -156,6 +203,7 @@ export function createSession(nowFn = Date.now) {
 
   function enter(clientId) {
     const stamp = now()
+    settleSleep(stamp)
     const existing = find(clientId)
     if (existing) {
       existing.enterStamp = stamp
@@ -193,6 +241,7 @@ export function createSession(nowFn = Date.now) {
       }
     }
     const stamp = now()
+    settleSleep(stamp)
     me.heartbeatStamp = stamp
     prune(stamp, clientId)
     return { code: "0000", data: view(me.guestId) }
@@ -207,8 +256,10 @@ export function createSession(nowFn = Date.now) {
         showMsg: "请先加入一起听",
       }
     }
+    const stamp = now()
+    settleSleep(stamp)
     if (participants.length === 1) {
-      pauseAt(now(), "")
+      pauseAt(stamp, "")
       participants = []
       return { code: "0000" }
     }
@@ -233,6 +284,7 @@ export function createSession(nowFn = Date.now) {
       }
     }
     const stamp = now()
+    settleSleep(stamp)
     content = normalizeEpisode(nextContent)
     playStatus = "PAUSED"
     speedRate = "1"
@@ -274,7 +326,43 @@ export function createSession(nowFn = Date.now) {
     return { code: "0000", roomStatus: roomStatus() }
   }
 
+  function setSleep(clientId, minutes) {
+    const me = find(clientId)
+    if (!me) {
+      return {
+        code: "E4003",
+        errMsg: "NOT_IN_SESSION",
+        showMsg: "请先加入一起听",
+      }
+    }
+    if (!isSleepChoice(minutes)) return { code: "E4000", errMsg: "BAD_SLEEP" }
+    const stamp = now()
+    settleSleep(stamp)
+    if (minutes === 0) {
+      sleepMinutes = null
+      sleepEndStamp = null
+    } else {
+      sleepMinutes = minutes
+      sleepEndStamp = stamp + minutes * 60_000
+    }
+    me.heartbeatStamp = stamp
+    return { code: "0000", data: view(me.guestId) }
+  }
+
+  function takeDueSleep() {
+    if (!settleSleep(now())) return null
+    return roomStatus()
+  }
+
+  function sleepDelay() {
+    if (sleepEndStamp == null) return null
+    const delay = sleepEndStamp - now()
+    if (delay <= 0) return 0
+    return delay
+  }
+
   function snapshotFor(clientId) {
+    settleSleep(now())
     const me = find(clientId)
     if (!me) return null
     return {
@@ -286,6 +374,7 @@ export function createSession(nowFn = Date.now) {
 
   function cleanupPlaying() {
     if (playStatus !== "PLAYING") return []
+    if (sleepEndStamp != null) return []
     const stamp = now()
     const oldLength = participants.length
     if (oldLength < 1) {
@@ -327,6 +416,9 @@ export function createSession(nowFn = Date.now) {
     leave,
     setContent,
     setPlayer,
+    setSleep,
+    takeDueSleep,
+    sleepDelay,
     snapshotFor,
     cleanupPlaying,
     participantCount,
