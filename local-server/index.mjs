@@ -2,6 +2,8 @@
  * 一起听服务。全站一个会话，没有房间号，也没有房主。
  * HTTP：/health、/pt-service、/room-operate、/parse-text。
  * WebSocket：/ws，播放状态立刻广播。会话只存在内存中，进程退出即清空。
+ * 定时关闭的截止点记在会话里。到点由本进程暂停并广播 NEW_STATUS，
+ * 不依赖页面里的倒计时。
  * 若存在前端构建产物（PT_STATIC_DIR 或 ../dist），同时托管静态资源与 SPA。
  */
 import http from "node:http"
@@ -92,6 +94,7 @@ export function createApp(options = {}) {
   const session = options.session || createSession(options.now)
   const fetchImpl = options.fetchImpl || globalThis.fetch
   let closed = false
+  let sleepTimer = null
 
   const server = http.createServer(async (req, res) => {
     const urlPath = (req.url || "/").split("?")[0]
@@ -163,6 +166,41 @@ export function createApp(options = {}) {
     }
   }
 
+  function clearSleepTimer() {
+    if (!sleepTimer) return
+    clearTimeout(sleepTimer)
+    sleepTimer = null
+  }
+
+  function armSleepTimer() {
+    clearSleepTimer()
+    const delay = session.sleepDelay()
+    if (delay == null) return
+    const wait = Math.max(0, Math.min(delay, 2_147_483_647))
+    sleepTimer = setTimeout(() => {
+      sleepTimer = null
+      const fired = publishDueSleep()
+      if (!fired) armSleepTimer()
+    }, wait)
+    if (typeof sleepTimer.unref === "function") sleepTimer.unref()
+  }
+
+  function publishDueSleep() {
+    const status = session.takeDueSleep()
+    if (!status) return false
+    clearSleepTimer()
+    broadcast({ responseType: "NEW_STATUS", roomStatus: status })
+    return true
+  }
+
+  function applySleep(clientId, minutes) {
+    const result = session.setSleep(clientId, minutes)
+    if (result.code !== "0000") return result
+    armSleepTimer()
+    broadcast({ responseType: "NEW_STATUS", roomStatus: session.roomStatus() })
+    return { code: "0000", data: result.data }
+  }
+
   function rejectSocket(socket, payload, closeCode) {
     wsSend(socket, { responseType: "ERROR", ...payload })
     socket.close(closeCode, payload.errMsg || "ERROR")
@@ -182,13 +220,7 @@ export function createApp(options = {}) {
       broadcast({
         responseType: "NEW_CONTENT",
         content: saved.data.content,
-        roomStatus: {
-          playStatus: saved.data.playStatus,
-          speedRate: saved.data.speedRate,
-          operator: saved.data.operator,
-          contentStamp: saved.data.contentStamp,
-          operateStamp: saved.data.operateStamp,
-        },
+        roomStatus: session.roomStatus(),
       })
     }
     return saved
@@ -198,12 +230,14 @@ export function createApp(options = {}) {
     if (method !== "POST") return { code: "E4005", errMsg: "METHOD_NOT_ALLOWED" }
     const clientId = normalizeClientId(body?.["x-pt-local-id"])
     if (!clientId) return { code: "E4000", errMsg: "BAD_LOCAL_ID" }
+    publishDueSleep()
     const operateType = body.operateType
     if (operateType === "CREATE") return { code: "E4000", errMsg: "CREATE_REMOVED" }
     if (operateType === "ENTER") return session.enter(clientId)
     if (operateType === "HEARTBEAT") return session.heartbeat(clientId)
     if (operateType === "LEAVE") return session.leave(clientId)
     if (operateType === "SET_CONTENT") return handleSetContent(clientId, body)
+    if (operateType === "SET_SLEEP") return applySleep(clientId, body?.sleepMinutes)
     return { code: "E4000", errMsg: "BAD_OPERATE" }
   }
 
@@ -228,6 +262,7 @@ export function createApp(options = {}) {
     const operateType = req?.operateType
     const clientId = normalizeClientId(req?.["x-pt-local-id"])
     const stamp = req?.["x-pt-stamp"]
+    const sleepFired = publishDueSleep()
     if (!operateType || !clientId || typeof stamp !== "number" || !Number.isFinite(stamp)) {
       rejectSocket(socket, { code: "E4000", errMsg: "BAD_MESSAGE" }, 4000)
       return
@@ -266,11 +301,28 @@ export function createApp(options = {}) {
       return
     }
 
+    if (operateType === "SET_SLEEP") {
+      if (!socket.joined) {
+        rejectSocket(socket, { code: "E4000", errMsg: "NEED_FIRST_SEND" }, 4000)
+        return
+      }
+      const result = applySleep(clientId, req.sleepMinutes)
+      if (result.code === "E4003") {
+        rejectSocket(socket, result, 4003)
+        return
+      }
+      if (result.code !== "0000") {
+        rejectSocket(socket, { code: "E4000", errMsg: result.errMsg || "BAD_SLEEP" }, 4000)
+      }
+      return
+    }
+
     if (operateType === "SET_PLAYER") {
       if (!socket.joined) {
         rejectSocket(socket, { code: "E4000", errMsg: "NEED_FIRST_SEND" }, 4000)
         return
       }
+      if (sleepFired) return
       if (!req.playStatus || req.speedRate == null || typeof req.contentStamp !== "number") {
         rejectSocket(socket, { code: "E4000", errMsg: "BAD_PLAYER" }, 4000)
         return
@@ -305,15 +357,20 @@ export function createApp(options = {}) {
     // 在心跳时限内重连，不会被立刻踢出，也不会占第二个名额。
   })
 
-  const timer = setInterval(() => {
-    session.cleanupPlaying()
-  }, PLAYING_SWEEP_MS)
+  function sweep() {
+    publishDueSleep()
+    return session.cleanupPlaying()
+  }
+
+  const timer = setInterval(sweep, PLAYING_SWEEP_MS)
   if (typeof timer.unref === "function") timer.unref()
+  armSleepTimer()
 
   function close() {
     if (closed) return Promise.resolve()
     closed = true
     clearInterval(timer)
+    clearSleepTimer()
     for (const socket of wss.clients) {
       try { socket.terminate() } catch { /* already gone */ }
     }
@@ -335,7 +392,7 @@ export function createApp(options = {}) {
     })
   }
 
-  return { server, session, close }
+  return { server, session, close, sweep }
 }
 
 function serveDemo(req, res) {

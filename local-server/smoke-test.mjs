@@ -62,8 +62,8 @@ function assertNoLegacy(value) {
   for (const key of LEGACY_KEYS) assert.equal(keys.has(key), false, key)
 }
 
-async function withServer(fn, fetchImpl = mockFetch) {
-  const app = createApp({ fetchImpl })
+async function withServer(fn, fetchImpl = mockFetch, now) {
+  const app = createApp({ fetchImpl, now })
   try {
     await new Promise((resolve, reject) => {
       app.server.once("error", reject)
@@ -345,8 +345,12 @@ test("play, pause, seek, and rate reach the other person within a second", async
         "operateStamp",
         "operator",
         "playStatus",
+        "sleepEndStamp",
+        "sleepMinutes",
         "speedRate",
       ])
+      assert.equal(right.first.roomStatus.sleepMinutes, null)
+      assert.equal(right.first.roomStatus.sleepEndStamp, null)
 
       const stamp = Date.now()
       const playingOnB = right.ws.waitFor((msg) => msg.responseType === "NEW_STATUS" && msg.roomStatus.playStatus === "PLAYING")
@@ -611,6 +615,294 @@ test("restarting the process clears participants and episode state", async () =>
   } finally {
     await second.stop()
   }
+})
+
+test("set, change, and cancel reach both seats, and a new episode keeps the deadline", async () => {
+  await withServer(async ({ base, wsUrl }) => {
+    await enter(base, "browser-a")
+    await enter(base, "browser-b")
+    await post(base, "/room-operate", {
+      operateType: "SET_CONTENT",
+      "x-pt-local-id": "browser-a",
+      link: EPISODE_URL,
+    })
+    const left = await joinSocket(wsUrl, "browser-a")
+    const right = await joinSocket(wsUrl, "browser-b")
+    try {
+      const outsider = await post(base, "/room-operate", {
+        operateType: "SET_SLEEP",
+        "x-pt-local-id": "browser-c",
+        sleepMinutes: 15,
+      })
+      assert.equal(outsider.body.errMsg, "NOT_IN_SESSION")
+      const bad = await post(base, "/room-operate", {
+        operateType: "SET_SLEEP",
+        "x-pt-local-id": "browser-a",
+        sleepMinutes: "30",
+      })
+      assert.deepEqual(bad.body, { code: "E4000", errMsg: "BAD_SLEEP" })
+
+      const before = Date.now()
+      const seenByB = right.ws.waitFor((msg) => msg.responseType === "NEW_STATUS" && msg.roomStatus?.sleepMinutes === 30)
+      const seenByA = left.ws.waitFor((msg) => msg.responseType === "NEW_STATUS" && msg.roomStatus?.sleepMinutes === 30)
+      const saved = await post(base, "/room-operate", {
+        operateType: "SET_SLEEP",
+        "x-pt-local-id": "browser-a",
+        sleepMinutes: 30,
+      })
+      const after = Date.now()
+      assert.equal(saved.body.code, "0000")
+      assert.equal(saved.body.data.sleepMinutes, 30)
+      assert.equal(saved.body.data.playStatus, "PAUSED")
+      assert.equal(saved.body.data.contentStamp, 0)
+      assert.ok(saved.body.data.sleepEndStamp >= before + 30 * 60_000)
+      assert.ok(saved.body.data.sleepEndStamp <= after + 30 * 60_000)
+      const pushedB = await seenByB
+      const pushedA = await seenByA
+      assert.equal(pushedB.roomStatus.sleepEndStamp, saved.body.data.sleepEndStamp)
+      assert.equal(pushedA.roomStatus.sleepEndStamp, saved.body.data.sleepEndStamp)
+      assert.equal("content" in pushedB, false)
+      assertNoLegacy(pushedB)
+
+      const changedOnA = left.ws.waitFor((msg) => msg.roomStatus?.sleepMinutes === 45)
+      right.ws.send(JSON.stringify({
+        operateType: "SET_SLEEP",
+        "x-pt-local-id": "browser-b",
+        "x-pt-stamp": Date.now(),
+        sleepMinutes: 45,
+      }))
+      const changed = await changedOnA
+      assert.equal(changed.roomStatus.sleepMinutes, 45)
+      assert.equal(changed.roomStatus.playStatus, "PAUSED")
+      assert.ok(changed.roomStatus.sleepEndStamp >= saved.body.data.sleepEndStamp)
+
+      const kept = left.ws.waitFor((msg) => msg.responseType === "NEW_CONTENT")
+      const replaced = await post(base, "/room-operate", {
+        operateType: "SET_CONTENT",
+        "x-pt-local-id": "browser-b",
+        link: EPISODE_URL,
+      })
+      assert.equal(replaced.body.code, "0000")
+      assert.equal(replaced.body.data.sleepMinutes, 45)
+      assert.equal(replaced.body.data.sleepEndStamp, changed.roomStatus.sleepEndStamp)
+      assert.equal(replaced.body.data.playStatus, "PAUSED")
+      assert.equal(replaced.body.data.contentStamp, 0)
+      const contentMsg = await kept
+      assert.equal(contentMsg.roomStatus.sleepEndStamp, changed.roomStatus.sleepEndStamp)
+      assert.equal(contentMsg.roomStatus.sleepMinutes, 45)
+      assert.equal(contentMsg.content.audioUrl, "https://media.xyzcdn.net/test-episode.m4a")
+
+      const clearedOnB = right.ws.waitFor((msg) => msg.roomStatus && msg.roomStatus.sleepEndStamp === null && msg.roomStatus.sleepMinutes === null)
+      const cleared = await post(base, "/room-operate", {
+        operateType: "SET_SLEEP",
+        "x-pt-local-id": "browser-a",
+        sleepMinutes: 0,
+      })
+      assert.equal(cleared.body.code, "0000")
+      assert.equal(cleared.body.data.sleepMinutes, null)
+      assert.equal(cleared.body.data.sleepEndStamp, null)
+      assert.equal(cleared.body.data.content.audioUrl, "https://media.xyzcdn.net/test-episode.m4a")
+      const clearedMsg = await clearedOnB
+      assert.equal(clearedMsg.responseType, "NEW_STATUS")
+      assert.equal(clearedMsg.roomStatus.playStatus, "PAUSED")
+    } finally {
+      left.ws.close()
+      right.ws.close()
+    }
+  })
+})
+
+test("a bad socket sleep command does not move an armed timer", async () => {
+  await withServer(async ({ base, wsUrl }) => {
+    await enter(base, "browser-a")
+    await enter(base, "browser-b")
+    const left = await joinSocket(wsUrl, "browser-a")
+    try {
+      const saved = await post(base, "/room-operate", {
+        operateType: "SET_SLEEP",
+        "x-pt-local-id": "browser-b",
+        sleepMinutes: 15,
+      })
+      assert.equal(saved.body.code, "0000")
+      const failed = left.ws.waitFor((msg) => msg.responseType === "ERROR")
+      left.ws.send(JSON.stringify({
+        operateType: "SET_SLEEP",
+        "x-pt-local-id": "browser-a",
+        "x-pt-stamp": Date.now(),
+        sleepMinutes: 10,
+      }))
+      const error = await failed
+      assert.equal(error.code, "E4000")
+      assert.equal(error.errMsg, "BAD_SLEEP")
+      const still = await post(base, "/room-operate", {
+        operateType: "HEARTBEAT",
+        "x-pt-local-id": "browser-b",
+      })
+      assert.equal(still.body.data.sleepMinutes, 15)
+      assert.equal(still.body.data.sleepEndStamp, saved.body.data.sleepEndStamp)
+    } finally {
+      left.ws.close()
+    }
+  })
+})
+
+test("backgrounded clients still pause together when the server reaches the deadline", async () => {
+  let time = 1_700_000_000_000
+  await withServer(async ({ base, wsUrl, app }) => {
+    await enter(base, "browser-a")
+    await enter(base, "browser-b")
+    await post(base, "/room-operate", {
+      operateType: "SET_CONTENT",
+      "x-pt-local-id": "browser-a",
+      link: EPISODE_URL,
+    })
+    const left = await joinSocket(wsUrl, "browser-a")
+    const right = await joinSocket(wsUrl, "browser-b")
+    try {
+      const started = time
+      const playing = right.ws.waitFor((msg) => msg.roomStatus?.playStatus === "PLAYING")
+      left.ws.send(JSON.stringify({
+        operateType: "SET_PLAYER",
+        "x-pt-local-id": "browser-a",
+        "x-pt-stamp": started,
+        playStatus: "PLAYING",
+        speedRate: "1.5",
+        contentStamp: 2000,
+      }))
+      await playing
+      const deadline = started + 15 * 60_000
+      const armed = right.ws.waitFor((msg) => msg.roomStatus?.sleepMinutes === 15)
+      const saved = await post(base, "/room-operate", {
+        operateType: "SET_SLEEP",
+        "x-pt-local-id": "browser-b",
+        sleepMinutes: 15,
+      })
+      assert.equal(saved.body.data.sleepEndStamp, deadline)
+      assert.equal(saved.body.data.playStatus, "PLAYING")
+      assert.equal((await armed).roomStatus.sleepEndStamp, deadline)
+
+      time = started + 60_000
+      app.sweep()
+      const early = await post(base, "/room-operate", {
+        operateType: "HEARTBEAT",
+        "x-pt-local-id": "browser-a",
+      })
+      assert.equal(early.body.data.playStatus, "PLAYING")
+      assert.equal(early.body.data.sleepEndStamp, deadline)
+      assert.equal(early.body.data.participants.length, 2)
+
+      const paused = right.ws.waitFor((msg) => {
+        return msg.responseType === "NEW_STATUS"
+          && msg.roomStatus?.playStatus === "PAUSED"
+          && msg.roomStatus?.sleepEndStamp === null
+      })
+      left.ws.close()
+      time = deadline
+      app.sweep()
+      const msg = await paused
+      const expected = 2000 + 15 * 60_000 * 1.5
+      assert.equal(msg.roomStatus.contentStamp, expected)
+      assert.equal(msg.roomStatus.operateStamp, deadline)
+      assert.equal(msg.roomStatus.operator, "")
+      assert.equal(msg.roomStatus.speedRate, "1.5")
+      assert.equal(msg.roomStatus.sleepMinutes, null)
+
+      const again = await joinSocket(wsUrl, "browser-a")
+      try {
+        assert.equal(again.first.roomStatus.playStatus, "PAUSED")
+        assert.equal(again.first.roomStatus.contentStamp, expected)
+        assert.equal(again.first.roomStatus.sleepEndStamp, null)
+        assert.equal(again.first.content.audioUrl, "https://media.xyzcdn.net/test-episode.m4a")
+        const still = await post(base, "/room-operate", {
+          operateType: "HEARTBEAT",
+          "x-pt-local-id": "browser-b",
+        })
+        assert.equal(still.body.code, "0000")
+        assert.equal(still.body.data.participants.length, 2)
+        assert.equal(still.body.data.playStatus, "PAUSED")
+        assert.equal(still.body.data.contentStamp, expected)
+        assert.equal(still.body.data.content.linkUrl, EPISODE_URL)
+      } finally {
+        again.ws.close()
+      }
+
+      const resumed = right.ws.waitFor((msg) => msg.roomStatus?.playStatus === "PLAYING")
+      right.ws.send(JSON.stringify({
+        operateType: "SET_PLAYER",
+        "x-pt-local-id": "browser-b",
+        "x-pt-stamp": deadline + 1000,
+        playStatus: "PLAYING",
+        speedRate: "1.5",
+        contentStamp: expected,
+      }))
+      const playingAgain = await resumed
+      assert.equal(playingAgain.roomStatus.playStatus, "PLAYING")
+      assert.equal(playingAgain.roomStatus.sleepEndStamp, null)
+    } finally {
+      left.ws.close()
+      right.ws.close()
+    }
+  }, mockFetch, () => time)
+})
+
+test("a player command that arrives as the deadline fires does not resume playback", async () => {
+  let time = 1_700_000_000_000
+  await withServer(async ({ base, wsUrl }) => {
+    await enter(base, "browser-a")
+    await enter(base, "browser-b")
+    await post(base, "/room-operate", {
+      operateType: "SET_CONTENT",
+      "x-pt-local-id": "browser-a",
+      link: EPISODE_URL,
+    })
+    const left = await joinSocket(wsUrl, "browser-a")
+    const right = await joinSocket(wsUrl, "browser-b")
+    try {
+      const started = time
+      const playing = right.ws.waitFor((msg) => msg.roomStatus?.playStatus === "PLAYING")
+      left.ws.send(JSON.stringify({
+        operateType: "SET_PLAYER",
+        "x-pt-local-id": "browser-a",
+        "x-pt-stamp": started,
+        playStatus: "PLAYING",
+        speedRate: "1",
+        contentStamp: 0,
+      }))
+      await playing
+      const deadline = started + 15 * 60_000
+      const armed = left.ws.waitFor((msg) => msg.roomStatus?.sleepMinutes === 15)
+      await post(base, "/room-operate", {
+        operateType: "SET_SLEEP",
+        "x-pt-local-id": "browser-a",
+        sleepMinutes: 15,
+      })
+      await armed
+      time = deadline
+      const paused = left.ws.waitFor((msg) => msg.roomStatus?.playStatus === "PAUSED")
+      right.ws.send(JSON.stringify({
+        operateType: "SET_PLAYER",
+        "x-pt-local-id": "browser-b",
+        "x-pt-stamp": deadline + 20,
+        playStatus: "PLAYING",
+        speedRate: "1.2",
+        contentStamp: 999999,
+      }))
+      const msg = await paused
+      assert.equal(msg.roomStatus.contentStamp, 15 * 60_000)
+      assert.equal(msg.roomStatus.speedRate, "1")
+      assert.equal(msg.roomStatus.sleepEndStamp, null)
+      const seen = await post(base, "/room-operate", {
+        operateType: "HEARTBEAT",
+        "x-pt-local-id": "browser-a",
+      })
+      assert.equal(seen.body.data.playStatus, "PAUSED")
+      assert.equal(seen.body.data.contentStamp, 15 * 60_000)
+      assert.equal(seen.body.data.speedRate, "1")
+    } finally {
+      left.ws.close()
+      right.ws.close()
+    }
+  }, mockFetch, () => time)
 })
 
 function startProcess() {
